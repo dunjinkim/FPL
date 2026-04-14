@@ -19,7 +19,7 @@ ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
 from analyzer.scale_bar import detect_scale_bar
-from analyzer.rod_detector import detect_rods, _do_edge_fill, _extract_contour_features
+from analyzer.rod_detector import detect_rods, detect_rod_in_region
 from analyzer.measurer import measure_rods, compute_statistics
 from analyzer.overlap_classifier import (
     OverlapClassifier,
@@ -53,6 +53,8 @@ def _init_state():
         "label_pending": {},
         "manual_rods": [],      # list[dict] — manually annotated rod features
         "manual_df": None,      # pd.DataFrame of manual measurements
+        "pending_points": [],   # [x, y] points for current 4-point selection
+        "last_click_t5": None,  # last processed click (dedup guard)
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -69,54 +71,6 @@ def get_classifier():
         labels_path=ROOT / "training_data" / "labels.csv",
     )
 
-
-# ── Manual annotation helper ─────────────────────────────────────────────────
-def _process_manual_rect(img_bgr: np.ndarray, x: int, y: int, w: int, h: int) -> dict | None:
-    """
-    Extract rod features from a user-drawn bounding box.
-
-    1. Crop the region and attempt edge-fill segmentation inside it.
-    2. If a contour is found, use its minAreaRect for precise measurement.
-    3. Fallback: treat the drawn rectangle itself as the rod shape.
-    """
-    crop = img_bgr[y:y+h, x:x+w]
-    if crop.size == 0 or min(crop.shape[:2]) < 5:
-        return None
-
-    gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop.copy()
-
-    feats = None
-    try:
-        binary = _do_edge_fill(gray_crop)
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            contour = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(contour) > 50:
-                feats = _extract_contour_features(contour)
-    except Exception:
-        pass
-
-    if feats is None:
-        # Fallback: use the drawn rectangle
-        local_contour = np.array([[[0, 0]], [[w, 0]], [[w, h]], [[0, h]]], dtype=np.int32)
-        feats = _extract_contour_features(local_contour)
-
-    # Offset position-dependent fields to original image coordinates
-    feats["center_x"] += x
-    feats["center_y"] += y
-    rc, rs, ra = feats["rect"]
-    feats["rect"] = ((rc[0] + x, rc[1] + y), rs, ra)
-    bx, by, bw, bh = feats["bbox"]
-    feats["bbox"] = (bx + x, by + y, bw, bh)
-    if feats.get("contour") is not None:
-        feats["contour"] = feats["contour"] + np.array([[[x, y]]])
-
-    feats["image_h"] = img_bgr.shape[0]
-    feats["image_w"] = img_bgr.shape[1]
-    feats["label_id"] = -1
-    feats["mean_intensity"] = float(gray_crop.mean())
-    feats["std_intensity"] = float(gray_crop.std())
-    return feats
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -144,6 +98,8 @@ with st.sidebar:
             st.session_state.label_pending = {}
             st.session_state.manual_rods = []
             st.session_state.manual_df = None
+            st.session_state.pending_points = []
+            st.session_state.last_click_t5 = None
 
     st.markdown("### 분석 파라미터")
     strip_ratio = st.slider(
@@ -584,14 +540,32 @@ with tab4:
 
 
 # ════════════════════════════════════════════════════════
-# TAB 5 — Manual rod annotation (slider-based, no external dependency)
+# TAB 5 — Manual rod annotation (4-point click selection)
 # ════════════════════════════════════════════════════════
 with tab5:
+    # ── Keyboard shortcut: ESC or Ctrl+D → undo last point ───────────────────
+    st.components.v1.html("""<script>
+    (function(){
+      function handler(e){
+        if(e.key==='Escape'||(e.ctrlKey&&e.key==='d')){
+          e.preventDefault();
+          try{
+            var btns=window.parent.document.querySelectorAll('button');
+            for(var i=0;i<btns.length;i++){
+              if(btns[i].innerText.trim().startsWith('\u232b')){btns[i].click();break;}
+            }
+          }catch(err){}
+        }
+      }
+      window.parent.document.addEventListener('keydown',handler);
+    })();
+    </script>""", height=0)
+
     st.markdown("### ✏️ 수동 라드 표시")
     st.markdown(
-        "자동 검출이 놓친 라드를 보완합니다. "
-        "자동 검출 성공 여부와 **관계없이** 항상 사용할 수 있습니다.  \n"
-        "슬라이더로 라드 위치와 크기를 맞추고 **[+ 라드 추가]** 를 누르세요."
+        "라드 주위를 **마우스로 4번 클릭**해 영역을 지정하면 그 안의 라드를 자동 인식·측정합니다.  \n"
+        "자동 검출 성공 여부와 **관계없이** 항상 사용 가능합니다.  \n"
+        "잘못 찍은 점은 **⌫ 되돌리기** 버튼 또는 **ESC / Ctrl+D** 로 취소합니다."
     )
 
     h_img, w_img = img_bgr.shape[:2]
@@ -607,129 +581,160 @@ with tab5:
             help="Tab 1에서 스케일바를 설정하면 자동으로 반영됩니다.",
         )
 
-    # ── Layout: controls | image ─────────────────────────────────────────────
-    col_ctrl, col_img = st.columns([1, 2], gap="medium")
+    pending = st.session_state.pending_points  # list of [x, y]
 
-    with col_ctrl:
-        st.markdown("**라드 위치 / 크기**")
-        man_x = st.slider("X 시작 (px)", 0, w_img - 2, w_img // 4, key="man_x")
-        man_y = st.slider("Y 시작 (px)", 0, h_img - 2, h_img // 4, key="man_y")
-        # Clamp max to remaining image space
-        max_w = max(2, w_img - man_x)
-        max_h = max(2, h_img - man_y)
-        default_w = int(st.session_state.get("man_w", max(2, w_img // 8)))
-        default_h = int(st.session_state.get("man_h", max(2, h_img // 8)))
-        man_w = st.slider("너비  (px)", 2, max_w,
-                          min(default_w, max_w), key="man_w")
-        man_h = st.slider("높이  (px)", 2, max_h,
-                          min(default_h, max_h), key="man_h")
+    try:
+        from streamlit_image_coordinates import streamlit_image_coordinates as _img_coords
+        from PIL import Image as _PIL
 
-        est_len = max(man_w, man_h) * nm_per_px_t5
-        est_dia = min(man_w, man_h) * nm_per_px_t5
-        st.caption(f"예상  길이 **{est_len:.0f} nm** / 직경 **{est_dia:.0f} nm**")
-
-        st.markdown("")
-        c1, c2 = st.columns(2)
-        with c1:
-            add_btn = st.button("+ 라드 추가", type="primary",
-                                use_container_width=True)
-        with c2:
-            clear_btn = st.button("전체 초기화", use_container_width=True)
-
-        if st.session_state.manual_rods:
-            st.markdown(f"**추가된 라드: {len(st.session_state.manual_rods)}개**")
-            # Per-rod delete buttons
-            for i, rod in enumerate(st.session_state.manual_rods):
-                ls = rod["long_side_px"] * nm_per_px_t5
-                ds = rod["short_side_px"] * nm_per_px_t5
-                col_info, col_del = st.columns([3, 1])
-                col_info.caption(f"M{i+1}: L={ls:.0f} D={ds:.0f} nm")
-                if col_del.button("✕", key=f"del_rod_{i}",
-                                  use_container_width=True):
-                    st.session_state.manual_rods.pop(i)
-                    # Rebuild manual_df after deletion
-                    records = []
-                    for j, r in enumerate(st.session_state.manual_rods):
-                        records.append({
-                            "id": f"M{j+1}",
-                            "length_nm":   round(r["long_side_px"]  * nm_per_px_t5, 2),
-                            "diameter_nm": round(r["short_side_px"] * nm_per_px_t5, 2),
-                            "aspect_ratio": round(r["aspect_ratio"], 3),
-                            "center_x":    round(r["center_x"], 1),
-                            "center_y":    round(r["center_y"], 1),
-                            "area_px2":    round(r["area_px"], 1),
-                        })
-                    st.session_state.manual_df = (
-                        pd.DataFrame(records) if records else None
-                    )
-                    st.rerun()
-
-    with col_img:
-        # Live preview: auto-detected (dim) + added manual (gold) + current selection (cyan)
-        preview = img_bgr.copy()
+        # ── Build overlay image ───────────────────────────────────────────────
+        ov = img_bgr.copy()
+        # Auto-detected outlines (dim)
         if rods and df_all is not None:
             for rod in rods:
                 box = cv2.boxPoints(rod["rect"])
-                cv2.drawContours(preview, [np.intp(box)], 0, (160, 100, 60), 1)
+                cv2.drawContours(ov, [np.intp(box)], 0, (160, 100, 60), 1)
+        # Already-added manual rods (gold)
         for rod in st.session_state.manual_rods:
             box = cv2.boxPoints(rod["rect"])
-            cv2.drawContours(preview, [np.intp(box)], 0, (0, 215, 255), 2)
-        # Current selection rectangle (bright cyan)
-        cv2.rectangle(preview,
-                      (man_x, man_y),
-                      (min(man_x + man_w, w_img - 1), min(man_y + man_h, h_img - 1)),
-                      (0, 255, 255), 2)
-        st.image(
-            cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
-            caption="🔵 자동 검출 (흐림)  🟡 추가된 수동 라드  ● 현재 선택 (밝은 청록)",
-            use_container_width=True,
-        )
+            cv2.drawContours(ov, [np.intp(box)], 0, (0, 215, 255), 2)
+        # Pending points + partial polygon (green)
+        for idx, (px, py) in enumerate(pending):
+            cv2.circle(ov, (px, py), 7, (0, 230, 0), -1)
+            cv2.putText(ov, str(idx + 1), (px + 9, py - 9),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 230, 0), 2, cv2.LINE_AA)
+        for idx in range(len(pending) - 1):
+            cv2.line(ov, tuple(pending[idx]), tuple(pending[idx + 1]),
+                     (0, 230, 0), 1)
+        if len(pending) == 4:
+            cv2.line(ov, tuple(pending[3]), tuple(pending[0]), (0, 230, 0), 1)
+            cv2.polylines(ov, [np.array(pending, dtype=np.int32)], True,
+                          (0, 230, 0), 2)
 
-    # ── Button actions ────────────────────────────────────────────────────────
-    if clear_btn:
-        st.session_state.manual_rods = []
-        st.session_state.manual_df = None
-        st.rerun()
+        pil_ov = _PIL.fromarray(cv2.cvtColor(ov, cv2.COLOR_BGR2RGB))
 
-    if add_btn:
-        rx = max(0, man_x)
-        ry = max(0, man_y)
-        rw = max(1, min(man_w, w_img - rx))
-        rh = max(1, min(man_h, h_img - ry))
-        feats = _process_manual_rect(img_bgr, rx, ry, rw, rh)
-        if feats:
-            st.session_state.manual_rods.append(feats)
+        # ── Layout ───────────────────────────────────────────────────────────
+        col_img5, col_ctrl5 = st.columns([3, 1], gap="medium")
+
+        with col_img5:
+            n_left = 4 - len(pending)
+            hint = (f"클릭하여 점 찍기 ({n_left}번 남음)" if n_left > 0
+                    else "4점 완료 — 오른쪽에서 결과 확인 후 추가하세요")
+            coord = _img_coords(pil_ov, key=f"t5_{st.session_state.image_name}")
+            st.caption(hint)
+
+        with col_ctrl5:
+            st.markdown(f"**선택 점: {len(pending)} / 4**")
+            for idx, (px, py) in enumerate(pending):
+                st.caption(f"점 {idx+1}: ({px}, {py})")
+
+            ca, cb = st.columns(2)
+            with ca:
+                undo_btn = st.button("⌫ 되돌리기",
+                                     disabled=(len(pending) == 0),
+                                     use_container_width=True,
+                                     help="마지막 점 취소 (ESC / Ctrl+D)")
+            with cb:
+                clr_btn = st.button("✕ 초기화",
+                                    disabled=(len(pending) == 0),
+                                    use_container_width=True)
+
+            # ── 4-point preview + add button ─────────────────────────────────
+            if len(pending) == 4:
+                st.markdown("---")
+                rod_prev = detect_rod_in_region(img_bgr, pending)
+                if rod_prev:
+                    ls = rod_prev["long_side_px"] * nm_per_px_t5
+                    ds = rod_prev["short_side_px"] * nm_per_px_t5
+                    st.metric("길이", f"{ls:.0f} nm")
+                    st.metric("직경", f"{ds:.0f} nm")
+                    st.metric("종횡비", f"{rod_prev['aspect_ratio']:.2f}")
+                add_btn = st.button("+ 라드 추가", type="primary",
+                                    use_container_width=True)
+            else:
+                rod_prev = None
+                add_btn  = False
+
+            # ── Added rods list ───────────────────────────────────────────────
+            if st.session_state.manual_rods:
+                st.markdown("---")
+                st.markdown(f"**추가된 라드: {len(st.session_state.manual_rods)}개**")
+                for idx, rod in enumerate(st.session_state.manual_rods):
+                    ls = rod["long_side_px"] * nm_per_px_t5
+                    ds = rod["short_side_px"] * nm_per_px_t5
+                    ci, cd = st.columns([3, 1])
+                    ci.caption(f"M{idx+1}: L={ls:.0f} D={ds:.0f} nm")
+                    if cd.button("✕", key=f"del5_{idx}", use_container_width=True):
+                        st.session_state.manual_rods.pop(idx)
+                        recs = []
+                        for j, r in enumerate(st.session_state.manual_rods):
+                            recs.append({
+                                "id": f"M{j+1}",
+                                "length_nm":    round(r["long_side_px"]  * nm_per_px_t5, 2),
+                                "diameter_nm":  round(r["short_side_px"] * nm_per_px_t5, 2),
+                                "aspect_ratio": round(r["aspect_ratio"], 3),
+                                "center_x":     round(r["center_x"], 1),
+                                "center_y":     round(r["center_y"], 1),
+                                "area_px2":     round(r["area_px"], 1),
+                            })
+                        st.session_state.manual_df = (
+                            pd.DataFrame(recs) if recs else None
+                        )
+                        st.rerun()
+
+        # ── Button actions ────────────────────────────────────────────────────
+        if undo_btn:
+            st.session_state.pending_points.pop()
+            st.rerun()
+
+        if clr_btn:
+            st.session_state.pending_points = []
+            st.rerun()
+
+        if add_btn and rod_prev:
+            st.session_state.manual_rods.append(rod_prev)
             clf.add_label(
                 {
-                    "area_px2":              feats["area_px"],
-                    "aspect_ratio":          feats["aspect_ratio"],
-                    "solidity":              feats["solidity"],
-                    "circularity":           feats["circularity"],
-                    "convexity_defect_count":feats["convexity_defect_count"],
-                    "mean_intensity":        feats.get("mean_intensity", 0),
-                    "std_intensity":         feats.get("std_intensity", 0),
+                    "area_px2":               rod_prev["area_px"],
+                    "aspect_ratio":           rod_prev["aspect_ratio"],
+                    "solidity":               rod_prev["solidity"],
+                    "circularity":            rod_prev["circularity"],
+                    "convexity_defect_count": rod_prev["convexity_defect_count"],
+                    "mean_intensity":         rod_prev.get("mean_intensity", 0),
+                    "std_intensity":          rod_prev.get("std_intensity", 0),
                 },
                 LABEL_SINGLE,
             )
-            records = []
-            for i, rod in enumerate(st.session_state.manual_rods):
-                records.append({
-                    "id":          f"M{i+1}",
-                    "length_nm":   round(rod["long_side_px"]  * nm_per_px_t5, 2),
-                    "diameter_nm": round(rod["short_side_px"] * nm_per_px_t5, 2),
-                    "aspect_ratio":round(rod["aspect_ratio"], 3),
-                    "center_x":   round(rod["center_x"], 1),
-                    "center_y":   round(rod["center_y"], 1),
-                    "area_px2":   round(rod["area_px"], 1),
+            recs = []
+            for j, r in enumerate(st.session_state.manual_rods):
+                recs.append({
+                    "id":           f"M{j+1}",
+                    "length_nm":    round(r["long_side_px"]  * nm_per_px_t5, 2),
+                    "diameter_nm":  round(r["short_side_px"] * nm_per_px_t5, 2),
+                    "aspect_ratio": round(r["aspect_ratio"], 3),
+                    "center_x":     round(r["center_x"], 1),
+                    "center_y":     round(r["center_y"], 1),
+                    "area_px2":     round(r["area_px"], 1),
                 })
-            st.session_state.manual_df = pd.DataFrame(records)
-            st.success(
-                f"라드 추가! 현재 수동 {len(st.session_state.manual_rods)}개 "
-                f"(학습 데이터에도 저장됨)"
-            )
+            st.session_state.manual_df = pd.DataFrame(recs)
+            st.session_state.pending_points = []
+            st.session_state.last_click_t5 = None
             st.rerun()
-        else:
-            st.warning("해당 영역에서 라드 윤곽을 찾지 못했습니다. 영역을 다시 조정해 보세요.")
+
+        # ── Handle new click ──────────────────────────────────────────────────
+        if coord is not None:
+            last = st.session_state.last_click_t5
+            if coord != last and len(pending) < 4:
+                st.session_state.pending_points.append([coord["x"], coord["y"]])
+                st.session_state.last_click_t5 = coord
+                st.rerun()
+
+    except ImportError:
+        st.warning(
+            "`streamlit-image-coordinates` 패키지가 필요합니다.\n\n"
+            "```\npip install streamlit-image-coordinates\n```\n\n"
+            "설치 후 앱을 재시작하세요."
+        )
 
     # ── Download ──────────────────────────────────────────────────────────────
     if st.session_state.manual_df is not None:

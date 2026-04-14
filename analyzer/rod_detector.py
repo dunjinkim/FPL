@@ -433,3 +433,107 @@ def detect_rods(
         rods.append(feats)
 
     return rods
+
+
+# ── Region-based single rod detection ────────────────────────────────────────
+
+def detect_rod_in_region(
+    image: np.ndarray,
+    pts: list,
+) -> dict | None:
+    """
+    Detect and measure the primary rod within a user-defined polygon.
+
+    The polygon (typically 4 points) defines *where to look*.  The function
+    then attempts to find the actual rod contour inside that region using
+    multiple binarisation strategies, so that the length/diameter reflect
+    the real rod shape rather than the drawn box.
+
+    Parameters
+    ----------
+    image : BGR or grayscale SEM image (full size)
+    pts   : list of (x, y) tuples/lists — at least 3, typically 4 points
+
+    Returns
+    -------
+    Feature dict in the same format as detect_rods() items, or None.
+    Falls back to the polygon's own minAreaRect if no contour is detected.
+    """
+    pts_arr = np.array(pts, dtype=np.int32).reshape(-1, 2)
+    gray = _to_gray(image)
+    h_img, w_img = gray.shape
+
+    # ── Bounding box of polygon ──────────────────────────────────────────────
+    x, y, bw, bh = cv2.boundingRect(pts_arr)
+    x  = max(0, x);      y  = max(0, y)
+    x2 = min(w_img, x + bw);  y2 = min(h_img, y + bh)
+    if x2 <= x or y2 <= y:
+        return None
+
+    # ── Polygon mask in full image, then crop ────────────────────────────────
+    mask_full = np.zeros((h_img, w_img), dtype=np.uint8)
+    cv2.fillPoly(mask_full, [pts_arr], 255)
+    mask_crop = mask_full[y:y2, x:x2]
+    gray_crop = gray[y:y2, x:x2].copy()
+
+    # Fill outside-polygon pixels with estimated background value so that
+    # thresholding only fires on the rod interior, not the surrounding region.
+    outside = gray_crop[mask_crop == 0]
+    bg_val  = int(np.median(outside)) if len(outside) else 0
+    gray_in = gray_crop.copy()
+    gray_in[mask_crop == 0] = bg_val
+
+    # ── Try binarisation methods in order ────────────────────────────────────
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    best_contour = None
+    best_area    = 0.0
+
+    for bfn in [_do_otsu, _do_adaptive, _do_edge_fill]:
+        try:
+            binary = bfn(gray_in)
+        except Exception:
+            continue
+
+        binary[mask_crop == 0] = 0
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, k3, iterations=1)
+
+        contours, _ = cv2.findContours(
+            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        for c in contours:
+            area = float(cv2.contourArea(c))
+            if area < 30:
+                continue
+            _, (rw, rh), _ = cv2.minAreaRect(c)
+            if min(rw, rh) < 1:
+                continue
+            ar = max(rw, rh) / min(rw, rh)
+            if ar >= 1.3 and area > best_area:
+                best_area    = area
+                best_contour = c
+
+        if best_contour is not None:
+            break   # stop at the first method that finds a rod-like contour
+
+    # ── Extract features ─────────────────────────────────────────────────────
+    if best_contour is None:
+        # Fallback: treat the polygon outline itself as the rod shape
+        feats = _extract_contour_features(pts_arr.reshape(-1, 1, 2))
+    else:
+        feats = _extract_contour_features(best_contour)
+        # Offset from crop → full-image coordinates
+        feats["center_x"] += x;  feats["center_y"] += y
+        rc, rs, ra = feats["rect"]
+        feats["rect"] = ((rc[0] + x, rc[1] + y), rs, ra)
+        bx2, by2, bw2, bh2 = feats["bbox"]
+        feats["bbox"] = (bx2 + x, by2 + y, bw2, bh2)
+        if feats.get("contour") is not None:
+            feats["contour"] = feats["contour"] + np.array([[[x, y]]])
+
+    inside = gray_crop[mask_crop == 255]
+    feats["mean_intensity"] = float(inside.mean()) if len(inside) else 0.0
+    feats["std_intensity"]  = float(inside.std())  if len(inside) else 0.0
+    feats["image_h"]  = h_img
+    feats["image_w"]  = w_img
+    feats["label_id"] = -1
+    return feats
