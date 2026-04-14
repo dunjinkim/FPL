@@ -85,7 +85,7 @@ with st.sidebar:
 
     st.markdown("### 분석 파라미터")
     strip_ratio = st.slider(
-        "정보 영역 비율 (하단 %)", min_value=5, max_value=30, value=15, step=1,
+        "정보 영역 비율 (하단 %)", min_value=5, max_value=30, value=7, step=1,
         help="SEM 메타데이터(스케일바) 영역이 이미지 하단 몇 %를 차지하는지 설정합니다.",
     ) / 100.0
 

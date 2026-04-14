@@ -86,7 +86,7 @@ def _ensure_rods_white(binary: np.ndarray) -> np.ndarray:
 
 def _count_blobs(binary: np.ndarray) -> int:
     """Quick count of connected components (for auto method selection)."""
-    _, n = cv2.connectedComponents(binary)
+    n, _ = cv2.connectedComponents(binary)
     return n - 1  # subtract background
 
 
