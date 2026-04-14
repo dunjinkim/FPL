@@ -6,7 +6,6 @@ Usage:
 """
 
 import io
-import os
 import sys
 from pathlib import Path
 
@@ -14,14 +13,14 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image
+from PIL import Image as PILImage
 
 # ── Path setup ───────────────────────────────────────────────────────────────
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
 from analyzer.scale_bar import detect_scale_bar
-from analyzer.rod_detector import detect_rods
+from analyzer.rod_detector import detect_rods, _do_edge_fill, _extract_contour_features
 from analyzer.measurer import measure_rods, compute_statistics
 from analyzer.overlap_classifier import (
     OverlapClassifier,
@@ -50,11 +49,11 @@ def _init_state():
         "image": None,          # np.ndarray BGR
         "image_name": "",
         "scale_info": None,
-        "rods": None,           # list[dict]
-        "df_measured": None,    # pd.DataFrame (all rods, overlap_label filled)
-        "classifier": None,
-        "label_pending": {},    # rod_id → label (during this session)
-        "analysis_done": False,
+        "rods": None,
+        "df_measured": None,
+        "label_pending": {},
+        "manual_rods": [],      # list[dict] — manually annotated rod features
+        "manual_df": None,      # pd.DataFrame of manual measurements
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -72,6 +71,55 @@ def get_classifier():
     )
 
 
+# ── Manual annotation helper ─────────────────────────────────────────────────
+def _process_manual_rect(img_bgr: np.ndarray, x: int, y: int, w: int, h: int) -> dict | None:
+    """
+    Extract rod features from a user-drawn bounding box.
+
+    1. Crop the region and attempt edge-fill segmentation inside it.
+    2. If a contour is found, use its minAreaRect for precise measurement.
+    3. Fallback: treat the drawn rectangle itself as the rod shape.
+    """
+    crop = img_bgr[y:y+h, x:x+w]
+    if crop.size == 0 or min(crop.shape[:2]) < 5:
+        return None
+
+    gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop.copy()
+
+    feats = None
+    try:
+        binary = _do_edge_fill(gray_crop)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            contour = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(contour) > 50:
+                feats = _extract_contour_features(contour)
+    except Exception:
+        pass
+
+    if feats is None:
+        # Fallback: use the drawn rectangle
+        local_contour = np.array([[[0, 0]], [[w, 0]], [[w, h]], [[0, h]]], dtype=np.int32)
+        feats = _extract_contour_features(local_contour)
+
+    # Offset position-dependent fields to original image coordinates
+    feats["center_x"] += x
+    feats["center_y"] += y
+    rc, rs, ra = feats["rect"]
+    feats["rect"] = ((rc[0] + x, rc[1] + y), rs, ra)
+    bx, by, bw, bh = feats["bbox"]
+    feats["bbox"] = (bx + x, by + y, bw, bh)
+    if feats.get("contour") is not None:
+        feats["contour"] = feats["contour"] + np.array([[[x, y]]])
+
+    feats["image_h"] = img_bgr.shape[0]
+    feats["image_w"] = img_bgr.shape[1]
+    feats["label_id"] = -1
+    feats["mean_intensity"] = float(gray_crop.mean())
+    feats["std_intensity"] = float(gray_crop.std())
+    return feats
+
+
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🔬 SEM Rod Analyzer")
@@ -82,6 +130,21 @@ with st.sidebar:
         type=["png", "jpg", "jpeg", "bmp", "tif", "tiff"],
         help="TIF/TIFF, PNG, JPG, BMP 모두 지원합니다.",
     )
+
+    # ── Store image immediately on upload ────────────────────────────────────
+    if uploaded is not None:
+        if st.session_state.image_name != uploaded.name:
+            file_bytes = np.frombuffer(uploaded.getvalue(), dtype=np.uint8)
+            img_loaded = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+            st.session_state.image = img_loaded
+            st.session_state.image_name = uploaded.name
+            # Reset all analysis state for new image
+            st.session_state.scale_info = None
+            st.session_state.rods = None
+            st.session_state.df_measured = None
+            st.session_state.label_pending = {}
+            st.session_state.manual_rods = []
+            st.session_state.manual_df = None
 
     st.markdown("### 분석 파라미터")
     strip_ratio = st.slider(
@@ -103,11 +166,10 @@ with st.sidebar:
     with st.expander("고급 세그멘테이션 설정"):
         enhance_contrast = st.checkbox(
             "콘트라스트 향상 (CLAHE)", value=True,
-            help="저콘트라스트 이미지에서 라드 검출률을 높입니다. 조명 불균일 시 특히 효과적입니다.",
+            help="저콘트라스트 이미지에서 라드 검출률을 높입니다.",
         )
         clahe_clip = st.slider(
             "CLAHE 강도", min_value=1.0, max_value=6.0, value=3.0, step=0.5,
-            help="값이 클수록 콘트라스트를 더 강하게 향상시킵니다. (권장: 2.0~4.0)",
             disabled=not enhance_contrast,
         )
         threshold_method = st.selectbox(
@@ -124,10 +186,7 @@ with st.sidebar:
                 "otsu":               "Otsu — 기본",
                 "triangle":           "Triangle — 히스토그램 한쪽 치우침",
             }[x],
-            help=(
-                "라드와 배경 밝기가 비슷한 경우 → '엣지 채우기' 또는 '기울기 Watershed' 선택.\n"
-                "'자동'은 밝기 방법 실패 시 엣지 채우기로 자동 전환합니다."
-            ),
+            help="라드와 배경 밝기가 비슷하면 '엣지 채우기'를 선택하세요.",
         )
 
     st.markdown("---")
@@ -153,51 +212,46 @@ with st.sidebar:
         qualified = sum(1 for v in counts.values() if v >= 5)
         st.caption(f"모델 학습까지 최소 2개 클래스 각 5개 이상 필요 (현재 충족: {qualified}개 클래스)")
 
-    if st.button("분석 실행", type="primary", disabled=uploaded is None):
-        file_bytes = np.frombuffer(uploaded.read(), dtype=np.uint8)
-        img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        st.session_state.image = img_bgr
-        st.session_state.image_name = uploaded.name
-        st.session_state.analysis_done = False
-        st.session_state.label_pending = {}
+    st.markdown("---")
+    if st.button("분석 실행", type="primary",
+                 disabled=st.session_state.image is None,
+                 use_container_width=True):
+        img_bgr_run = st.session_state.image
+        clf_run = get_classifier()
 
         with st.spinner("스케일바 검출 중..."):
-            scale_info = detect_scale_bar(img_bgr, info_strip_ratio=strip_ratio)
-        st.session_state.scale_info = scale_info
+            scale_info_run = detect_scale_bar(img_bgr_run, info_strip_ratio=strip_ratio)
+        st.session_state.scale_info = scale_info_run
 
-        if not scale_info["success"]:
-            st.warning(
-                "스케일바를 자동으로 검출하지 못했습니다. "
-                "'Tab 1 > 스케일바 수동 입력'으로 nm/px 값을 직접 입력해 주세요."
-            )
+        if not scale_info_run["success"]:
+            st.warning("스케일바를 자동으로 검출하지 못했습니다. Tab 1에서 nm/px를 직접 입력해 주세요.")
 
         with st.spinner("라드 검출 중..."):
-            rods = detect_rods(
-                img_bgr,
-                strip_y=scale_info["strip_y"],
+            rods_run = detect_rods(
+                img_bgr_run,
+                strip_y=scale_info_run["strip_y"],
                 min_area_px=min_area,
                 min_aspect_ratio=min_ar,
                 enhance_contrast=enhance_contrast,
                 clahe_clip=clahe_clip,
                 threshold_method=threshold_method,
             )
-        st.session_state.rods = rods
+        st.session_state.rods = rods_run
 
-        if scale_info["success"] and rods:
+        if scale_info_run["success"] and rods_run:
             with st.spinner("측정 및 분류 중..."):
-                df = measure_rods(rods, scale_info["nm_per_pixel"],
-                                  exclude_boundary=exclude_boundary)
-                df = clf.classify(df)
-            st.session_state.df_measured = df
-            st.session_state.analysis_done = True
-        elif rods:
+                df_run = measure_rods(rods_run, scale_info_run["nm_per_pixel"],
+                                      exclude_boundary=exclude_boundary)
+                df_run = clf_run.classify(df_run)
+            st.session_state.df_measured = df_run
+        elif rods_run:
             st.info("스케일바 정보를 Tab 1에서 입력 후 '측정 적용' 버튼을 눌러 주세요.")
-            # store rods anyway for preview
             st.session_state.df_measured = None
-            st.session_state.analysis_done = False
+        else:
+            st.session_state.df_measured = None
 
 
-# ── Main area tabs ────────────────────────────────────────────────────────────
+# ── Main area ─────────────────────────────────────────────────────────────────
 if st.session_state.image is None:
     st.markdown(
         """
@@ -207,8 +261,7 @@ if st.session_state.image is None:
         1. 왼쪽 사이드바에서 SEM 이미지를 업로드합니다.
         2. 필요시 분석 파라미터를 조정합니다.
         3. **분석 실행** 버튼을 클릭합니다.
-        4. Tab 3에서 측정 결과를 확인하고 CSV/Excel로 다운로드합니다.
-        5. Tab 4에서 겹침 라벨링을 진행하면 ML 모델이 자동 분류 정확도를 향상시킵니다.
+        4. 자동 검출이 안 될 경우 **✏️ 수동 라드 표시** 탭에서 직접 표시합니다.
 
         **지원 형식**: TIF, TIFF, PNG, JPG, BMP
         """
@@ -221,68 +274,79 @@ rods = st.session_state.rods or []
 df_all = st.session_state.df_measured
 clf = get_classifier()
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📏 스케일바", "🔍 세그멘테이션", "📊 측정 결과", "🏷️ 학습 데이터"]
+# ── Image preview before analysis ────────────────────────────────────────────
+if scale_info is None:
+    st.image(
+        cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB),
+        caption=st.session_state.image_name,
+        use_container_width=True,
+    )
+    st.info("왼쪽 **[분석 실행]** 버튼을 누르거나, 아래 **✏️ 수동 라드 표시** 탭에서 직접 라드를 표시하세요.")
+
+# ── Tabs ──────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📏 스케일바", "🔍 세그멘테이션", "📊 측정 결과", "🏷️ 학습 데이터", "✏️ 수동 라드 표시"]
 )
 
 # ════════════════════════════════════════════════════════
 # TAB 1 — Scale bar
 # ════════════════════════════════════════════════════════
 with tab1:
-    col_img, col_info = st.columns([2, 1])
+    if scale_info is None:
+        st.info("분석을 먼저 실행하세요.")
+    else:
+        col_img, col_info = st.columns([2, 1])
 
-    with col_img:
-        annotated_sb = annotate_scale_bar(img_bgr, scale_info)
-        st.image(
-            cv2.cvtColor(annotated_sb, cv2.COLOR_BGR2RGB),
-            caption="원본 이미지 (스케일바 영역 하이라이트)",
-            use_container_width=True,
-        )
+        with col_img:
+            annotated_sb = annotate_scale_bar(img_bgr, scale_info)
+            st.image(
+                cv2.cvtColor(annotated_sb, cv2.COLOR_BGR2RGB),
+                caption="원본 이미지 (스케일바 영역 하이라이트)",
+                use_container_width=True,
+            )
 
-    with col_info:
-        st.markdown("### 스케일바 검출 결과")
-        if scale_info["success"]:
-            st.success("자동 검출 성공")
-            st.metric("검출된 라벨", scale_info["text"] or "(없음)")
-            st.metric("스케일바 픽셀 길이", f"{scale_info['bar_px']} px")
-            st.metric("스케일 값", f"{scale_info['scale_nm']:.1f} nm")
-            st.metric("nm/pixel", f"{scale_info['nm_per_pixel']:.4f}")
-        else:
-            st.warning("자동 검출 실패")
-            st.markdown("OCR 텍스트:")
-            st.code(scale_info.get("text", "(없음)"))
-
-        st.markdown("---")
-        st.markdown("### 수동 입력")
-        manual_nm_per_px = st.number_input(
-            "nm / pixel (직접 입력)", min_value=0.001, max_value=10000.0,
-            value=float(scale_info["nm_per_pixel"] or 1.0),
-            format="%.4f",
-            help="스케일바 자동 검출이 안 된 경우, 직접 값을 입력하세요."
-        )
-        if st.button("측정 적용"):
-            # Re-detect with current parameters so results stay consistent
-            with st.spinner("라드 재검출 중..."):
-                rods_new = detect_rods(
-                    img_bgr,
-                    strip_y=scale_info["strip_y"],
-                    min_area_px=min_area,
-                    min_aspect_ratio=min_ar,
-                    enhance_contrast=enhance_contrast,
-                    clahe_clip=clahe_clip,
-                    threshold_method=threshold_method,
-                )
-            st.session_state.rods = rods_new
-            st.session_state.scale_info["nm_per_pixel"] = manual_nm_per_px
-            st.session_state.scale_info["success"] = True
-            if rods_new:
-                df = measure_rods(rods_new, manual_nm_per_px,
-                                  exclude_boundary=exclude_boundary)
-                df = clf.classify(df)
-                st.session_state.df_measured = df
+        with col_info:
+            st.markdown("### 스케일바 검출 결과")
+            if scale_info["success"]:
+                st.success("자동 검출 성공")
+                st.metric("검출된 라벨", scale_info["text"] or "(없음)")
+                st.metric("스케일바 픽셀 길이", f"{scale_info['bar_px']} px")
+                st.metric("스케일 값", f"{scale_info['scale_nm']:.1f} nm")
+                st.metric("nm/pixel", f"{scale_info['nm_per_pixel']:.4f}")
             else:
-                st.session_state.df_measured = None
-            st.rerun()
+                st.warning("자동 검출 실패")
+                st.markdown("OCR 텍스트:")
+                st.code(scale_info.get("text", "(없음)"))
+
+            st.markdown("---")
+            st.markdown("### 수동 입력")
+            manual_nm_per_px = st.number_input(
+                "nm / pixel (직접 입력)", min_value=0.001, max_value=10000.0,
+                value=float(scale_info["nm_per_pixel"] or 1.0),
+                format="%.4f",
+            )
+            if st.button("측정 적용"):
+                with st.spinner("라드 재검출 중..."):
+                    rods_new = detect_rods(
+                        img_bgr,
+                        strip_y=scale_info["strip_y"],
+                        min_area_px=min_area,
+                        min_aspect_ratio=min_ar,
+                        enhance_contrast=enhance_contrast,
+                        clahe_clip=clahe_clip,
+                        threshold_method=threshold_method,
+                    )
+                st.session_state.rods = rods_new
+                st.session_state.scale_info["nm_per_pixel"] = manual_nm_per_px
+                st.session_state.scale_info["success"] = True
+                if rods_new:
+                    df_new = measure_rods(rods_new, manual_nm_per_px,
+                                         exclude_boundary=exclude_boundary)
+                    df_new = clf.classify(df_new)
+                    st.session_state.df_measured = df_new
+                else:
+                    st.session_state.df_measured = None
+                st.rerun()
 
 
 # ════════════════════════════════════════════════════════
@@ -290,7 +354,7 @@ with tab1:
 # ════════════════════════════════════════════════════════
 with tab2:
     st.markdown("### 세그멘테이션 결과")
-    if st.session_state.scale_info is None:
+    if scale_info is None:
         st.info("분석을 먼저 실행하세요.")
     else:
         from analyzer.rod_detector import (
@@ -301,13 +365,10 @@ with tab2:
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         strip_y = scale_info["strip_y"]
         masked = _mask_strip(gray, strip_y)
-
-        # Reproduce the same preprocessing used during analysis
         preprocessed = _preprocess(masked, enhance_contrast, clahe_clip)
-        binary   = _binarise(preprocessed, method=threshold_method)
-        cleaned  = _morphological_clean(binary)
+        binary = _binarise(preprocessed, method=threshold_method)
+        cleaned = _morphological_clean(binary)
 
-        # ── Row 1: original vs CLAHE-enhanced ──
         if enhance_contrast:
             st.markdown("**전처리 비교**")
             c1, c2 = st.columns(2)
@@ -317,10 +378,8 @@ with tab2:
                 enhanced_vis = _enhance_contrast(masked, clip_limit=clahe_clip)
                 st.image(enhanced_vis, caption=f"CLAHE 적용 (강도 {clahe_clip})", use_container_width=True, clamp=True)
 
-        # ── Row 2: binary + overlay ──
         st.markdown("**세그멘테이션 결과**")
         col_a, col_b = st.columns(2)
-
         with col_a:
             st.image(cleaned, caption=f"이진화 ({threshold_method})", use_container_width=True, clamp=True)
 
@@ -337,104 +396,109 @@ with tab2:
                 use_container_width=True,
             )
             if len(rods) == 0:
-                st.warning("라드가 검출되지 않았습니다. 최소 면적·종횡비를 낮추거나 CLAHE 강도를 높여 보세요.")
+                st.warning("라드가 검출되지 않았습니다. **✏️ 수동 라드 표시** 탭을 이용해 보세요.")
 
 
 # ════════════════════════════════════════════════════════
 # TAB 3 — Measurement results
 # ════════════════════════════════════════════════════════
 with tab3:
-    if df_all is None:
-        st.info("분석을 먼저 실행하세요.")
+    has_auto   = df_all is not None
+    has_manual = bool(st.session_state.manual_rods) and st.session_state.manual_df is not None
+
+    if not has_auto and not has_manual:
+        st.info("분석을 실행하거나 **✏️ 수동 라드 표시** 탭에서 라드를 표시하세요.")
     else:
-        df_single  = df_all[df_all["overlap_label"] == LABEL_SINGLE].copy()
-        df_overlap = df_all[df_all["overlap_label"] == LABEL_OVERLAP].copy()
-        df_partial = df_all[df_all["overlap_label"] == LABEL_PARTIAL].copy()
-        df_notrod  = df_all[df_all["overlap_label"] == LABEL_NOT_ROD].copy()
+        if has_auto:
+            df_single  = df_all[df_all["overlap_label"] == LABEL_SINGLE].copy()
+            df_overlap = df_all[df_all["overlap_label"] == LABEL_OVERLAP].copy()
+            df_partial = df_all[df_all["overlap_label"] == LABEL_PARTIAL].copy()
+            df_notrod  = df_all[df_all["overlap_label"] == LABEL_NOT_ROD].copy()
 
-        st.markdown(
-            f"**전체 검출:** {len(df_all)}개 &nbsp;|&nbsp; "
-            f"🟢 **단일:** {len(df_single)}개 &nbsp;|&nbsp; "
-            f"🔴 **겹침:** {len(df_overlap)}개 &nbsp;|&nbsp; "
-            f"🔵 **일부:** {len(df_partial)}개 &nbsp;|&nbsp; "
-            f"🟣 **라드 아님:** {len(df_notrod)}개"
-        )
+            st.markdown(
+                f"**자동 검출:** {len(df_all)}개 &nbsp;|&nbsp; "
+                f"🟢 단일: {len(df_single)}개 &nbsp;|&nbsp; "
+                f"🔴 겹침: {len(df_overlap)}개 &nbsp;|&nbsp; "
+                f"🔵 일부: {len(df_partial)}개 &nbsp;|&nbsp; "
+                f"🟣 라드 아님: {len(df_notrod)}개"
+            )
+            annotated = annotate_image(img_bgr, rods, df_all, show_measurements=True)
 
-        # Annotated image
-        annotated = annotate_image(img_bgr, rods, df_all, show_measurements=True)
-        st.image(
-            cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-            caption="🟢 단일(측정 포함) / 🔴 겹침 / 🔵 일부 / 🟣 라드 아님 (모두 측정 제외)",
-            use_container_width=True,
-        )
+            # Overlay manual rods (gold) on top of auto annotation
+            if has_manual:
+                for rod in st.session_state.manual_rods:
+                    box = cv2.boxPoints(rod["rect"])
+                    box = np.intp(box)
+                    cv2.drawContours(annotated, [box], 0, (0, 215, 255), 2)
 
-        # ── Statistics ──
-        st.markdown("### 통계 요약")
-        stats_df = compute_statistics(df_all)
-        if not stats_df.empty:
-            st.dataframe(stats_df, use_container_width=True, hide_index=True)
-
-        # ── Distribution plots ──
-        if not df_single.empty:
-            st.markdown("### 분포 그래프")
-            dist_plots = plot_distributions(df_single)
-            scatter_png = plot_scatter(df_single)
-
-            col1, col2 = st.columns(2)
-            if "length_nm" in dist_plots:
-                with col1:
-                    st.image(dist_plots["length_nm"], caption="길이 분포")
-            if "diameter_nm" in dist_plots:
-                with col2:
-                    st.image(dist_plots["diameter_nm"], caption="직경 분포")
-
-            col3, col4 = st.columns(2)
-            if "aspect_ratio" in dist_plots:
-                with col3:
-                    st.image(dist_plots["aspect_ratio"], caption="종횡비 분포")
-            if scatter_png:
-                with col4:
-                    st.image(scatter_png, caption="길이 vs 직경")
-
-        # ── Data table ──
-        st.markdown("### 측정 데이터 (단일 라드)")
-        display_cols = ["id", "length_nm", "diameter_nm", "aspect_ratio",
-                        "center_x", "center_y", "area_px2"]
-        if not df_single.empty:
-            st.dataframe(df_single[display_cols], use_container_width=True, hide_index=True)
-
-        # ── Downloads ──
-        st.markdown("### 다운로드")
-        col_dl1, col_dl2, col_dl3 = st.columns(3)
-
-        with col_dl1:
-            csv_bytes = df_single[display_cols].to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "CSV 다운로드", data=csv_bytes,
-                file_name=f"{Path(st.session_state.image_name).stem}_rods.csv",
-                mime="text/csv",
+            st.image(
+                cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+                caption="🟢 단일 / 🔴 겹침 / 🔵 일부 / 🟣 라드 아님 / 🟡 수동 표시",
+                use_container_width=True,
             )
 
-        with col_dl2:
-            excel_buf = io.BytesIO()
-            with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-                df_single[display_cols].to_excel(writer, sheet_name="Measurements", index=False)
-                if not stats_df.empty:
-                    stats_df.to_excel(writer, sheet_name="Statistics", index=False)
-            excel_buf.seek(0)
-            st.download_button(
-                "Excel 다운로드", data=excel_buf.read(),
-                file_name=f"{Path(st.session_state.image_name).stem}_rods.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            st.markdown("### 통계 요약")
+            stats_df = compute_statistics(df_all)
+            if not stats_df.empty:
+                st.dataframe(stats_df, use_container_width=True, hide_index=True)
 
-        with col_dl3:
-            _, img_encoded = cv2.imencode(".png", annotated)
-            st.download_button(
-                "주석 이미지 저장", data=img_encoded.tobytes(),
-                file_name=f"{Path(st.session_state.image_name).stem}_annotated.png",
-                mime="image/png",
-            )
+            if not df_single.empty:
+                st.markdown("### 분포 그래프")
+                dist_plots = plot_distributions(df_single)
+                scatter_png = plot_scatter(df_single)
+                col1, col2 = st.columns(2)
+                if "length_nm" in dist_plots:
+                    with col1:
+                        st.image(dist_plots["length_nm"], caption="길이 분포")
+                if "diameter_nm" in dist_plots:
+                    with col2:
+                        st.image(dist_plots["diameter_nm"], caption="직경 분포")
+                col3, col4 = st.columns(2)
+                if "aspect_ratio" in dist_plots:
+                    with col3:
+                        st.image(dist_plots["aspect_ratio"], caption="종횡비 분포")
+                if scatter_png:
+                    with col4:
+                        st.image(scatter_png, caption="길이 vs 직경")
+
+            display_cols = ["id", "length_nm", "diameter_nm", "aspect_ratio",
+                            "center_x", "center_y", "area_px2"]
+            st.markdown("### 자동 측정 데이터 (단일 라드)")
+            if not df_single.empty:
+                st.dataframe(df_single[display_cols], use_container_width=True, hide_index=True)
+
+            st.markdown("### 다운로드")
+            col_dl1, col_dl2, col_dl3 = st.columns(3)
+            stem = Path(st.session_state.image_name).stem
+            with col_dl1:
+                csv_bytes = df_single[display_cols].to_csv(index=False).encode("utf-8-sig")
+                st.download_button("CSV 다운로드", data=csv_bytes,
+                                   file_name=f"{stem}_rods.csv", mime="text/csv")
+            with col_dl2:
+                excel_buf = io.BytesIO()
+                with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+                    df_single[display_cols].to_excel(writer, sheet_name="Auto", index=False)
+                    if has_manual:
+                        st.session_state.manual_df.to_excel(writer, sheet_name="Manual", index=False)
+                    if not stats_df.empty:
+                        stats_df.to_excel(writer, sheet_name="Statistics", index=False)
+                excel_buf.seek(0)
+                st.download_button("Excel 다운로드", data=excel_buf.read(),
+                                   file_name=f"{stem}_rods.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            with col_dl3:
+                _, img_enc = cv2.imencode(".png", annotated)
+                st.download_button("주석 이미지 저장", data=img_enc.tobytes(),
+                                   file_name=f"{stem}_annotated.png", mime="image/png")
+
+        if has_manual:
+            st.markdown("---")
+            st.markdown(f"### 수동 표시 라드: {len(st.session_state.manual_rods)}개")
+            st.dataframe(st.session_state.manual_df, use_container_width=True, hide_index=True)
+            csv_manual = st.session_state.manual_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("수동 측정 CSV 다운로드", data=csv_manual,
+                               file_name=f"{Path(st.session_state.image_name).stem}_manual.csv",
+                               mime="text/csv")
 
 
 # ════════════════════════════════════════════════════════
@@ -443,8 +507,6 @@ with tab3:
 with tab4:
     st.markdown("### 학습 데이터 수집")
     st.markdown(
-        "각 객체를 보고 알맞은 라벨을 달아 주세요.  \n"
-        "라벨이 쌓이면 사이드바의 **모델 학습** 버튼으로 분류기를 개선할 수 있습니다.\n\n"
         "🟢 **단일** – 온전한 라드 한 개 &nbsp;|&nbsp; "
         "🔴 **겹침** – 두 개 이상 겹친 클러스터 &nbsp;|&nbsp; "
         "🔵 **일부** – 절단되거나 일부만 보이는 라드 &nbsp;|&nbsp; "
@@ -454,9 +516,7 @@ with tab4:
     if df_all is None:
         st.info("분석을 먼저 실행하세요.")
     else:
-        clf = get_classifier()
         idx_to_row = {int(row["_rod_ref"]): row for _, row in df_all.iterrows()}
-
         visible_rods = [(i, rod) for i, rod in enumerate(rods) if i in idx_to_row]
 
         _LABEL_BADGE = {
@@ -483,21 +543,6 @@ with tab4:
                     with col:
                         st.image(thumb, caption=f"#{rid}", use_container_width=True)
                         st.markdown(_LABEL_BADGE.get(current_label, ":orange[● 미분류]"))
-
-                        def _make_callback(r_id, lbl):
-                            def cb():
-                                clf.add_label(
-                                    idx_to_row[
-                                        next(k for k, v in idx_to_row.items() if int(v["id"]) == r_id)
-                                    ].to_dict(),
-                                    lbl,
-                                )
-                                st.session_state.df_measured.loc[
-                                    st.session_state.df_measured["id"] == r_id,
-                                    "overlap_label",
-                                ] = lbl
-                            return cb
-
                         btn_row1 = st.columns(2)
                         btn_row2 = st.columns(2)
                         with btn_row1[0]:
@@ -529,7 +574,6 @@ with tab4:
                                 ] = LABEL_NOT_ROD
                                 st.rerun()
 
-        # Running label summary
         counts = clf.label_counts()
         st.markdown("---")
         st.markdown(
@@ -537,4 +581,157 @@ with tab4:
             f"단일 {counts[LABEL_SINGLE]}개 / 겹침 {counts[LABEL_OVERLAP]}개 / "
             f"일부 {counts[LABEL_PARTIAL]}개 / 라드 아님 {counts[LABEL_NOT_ROD]}개  \n"
             f"모델 학습 조건: 최소 2개 클래스 각 5개 이상"
+        )
+
+
+# ════════════════════════════════════════════════════════
+# TAB 5 — Manual rod annotation
+# ════════════════════════════════════════════════════════
+with tab5:
+    st.markdown("### ✏️ 수동 라드 표시")
+    st.markdown(
+        "자동 검출이 실패했을 때 이미지에서 **라드 주위에 사각형을 직접 그려** 측정할 수 있습니다.  \n"
+        "표시된 영역은 학습 데이터(단일 라드)로도 자동 저장됩니다."
+    )
+
+    try:
+        from streamlit_drawable_canvas import st_canvas
+
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = PILImage.fromarray(img_rgb)
+
+        h_orig, w_orig = img_bgr.shape[:2]
+        CANVAS_W = min(900, w_orig)
+        CANVAS_H = int(h_orig * CANVAS_W / w_orig)
+        scale_x = CANVAS_W / w_orig
+        scale_y = CANVAS_H / h_orig
+
+        pil_resized = pil_img.resize((CANVAS_W, CANVAS_H), PILImage.LANCZOS)
+
+        st.markdown("**사각형 도구로 라드 영역을 그리세요** (여러 개 가능)")
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 255, 0, 0.15)",
+            stroke_width=2,
+            stroke_color="#FFD700",
+            background_image=pil_resized,
+            update_streamlit=True,
+            width=CANVAS_W,
+            height=CANVAS_H,
+            drawing_mode="rect",
+            key=f"canvas_{st.session_state.image_name}",
+        )
+
+        objects = canvas_result.json_data.get("objects", []) if canvas_result.json_data else []
+        n_shapes = len(objects)
+        st.caption(f"그려진 사각형: {n_shapes}개")
+
+        # nm/px from scale_info (if available)
+        nm_per_px = None
+        if scale_info and scale_info.get("success") and scale_info.get("nm_per_pixel"):
+            nm_per_px = scale_info["nm_per_pixel"]
+            st.caption(f"스케일 정보: {nm_per_px:.4f} nm/px (자동 검출)")
+        else:
+            nm_per_px_manual = st.number_input(
+                "nm / pixel (수동 입력)", min_value=0.001, max_value=10000.0,
+                value=1.0, format="%.4f",
+                help="스케일바 분석이 안 된 경우 직접 입력하세요. Tab 1에서 설정하면 자동으로 반영됩니다.",
+            )
+            nm_per_px = nm_per_px_manual
+
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            process_btn = st.button(
+                "라드 처리 및 측정", type="primary",
+                disabled=(n_shapes == 0), use_container_width=True
+            )
+        with col_btn2:
+            clear_btn = st.button("수동 라드 초기화", use_container_width=True)
+
+        if clear_btn:
+            st.session_state.manual_rods = []
+            st.session_state.manual_df = None
+            st.rerun()
+
+        if process_btn and objects:
+            new_rods = []
+            for obj in objects:
+                if obj.get("type") != "rect":
+                    continue
+                # Canvas uses scaleX/scaleY for resize; multiply dimensions
+                sx = obj.get("scaleX", 1.0)
+                sy = obj.get("scaleY", 1.0)
+                rx = int(obj.get("left", 0) / scale_x)
+                ry = int(obj.get("top", 0) / scale_y)
+                rw = int(obj.get("width", 0) * sx / scale_x)
+                rh = int(obj.get("height", 0) * sy / scale_y)
+
+                rx = max(0, min(rx, w_orig - 1))
+                ry = max(0, min(ry, h_orig - 1))
+                rw = max(1, min(rw, w_orig - rx))
+                rh = max(1, min(rh, h_orig - ry))
+
+                feats = _process_manual_rect(img_bgr, rx, ry, rw, rh)
+                if feats:
+                    new_rods.append(feats)
+
+            st.session_state.manual_rods = new_rods
+
+            if new_rods:
+                records = []
+                for i, rod in enumerate(new_rods):
+                    records.append({
+                        "id": f"M{i+1}",
+                        "length_nm": round(rod["long_side_px"] * nm_per_px, 2),
+                        "diameter_nm": round(rod["short_side_px"] * nm_per_px, 2),
+                        "aspect_ratio": round(rod["aspect_ratio"], 3),
+                        "center_x": round(rod["center_x"], 1),
+                        "center_y": round(rod["center_y"], 1),
+                        "area_px2": round(rod["area_px"], 1),
+                    })
+                    # Add to classifier as "single" training example
+                    clf.add_label({
+                        "area_px2": rod["area_px"],
+                        "aspect_ratio": rod["aspect_ratio"],
+                        "solidity": rod["solidity"],
+                        "circularity": rod["circularity"],
+                        "convexity_defect_count": rod["convexity_defect_count"],
+                        "mean_intensity": rod["mean_intensity"],
+                        "std_intensity": rod["std_intensity"],
+                    }, LABEL_SINGLE)
+
+                st.session_state.manual_df = pd.DataFrame(records)
+                st.success(f"{len(new_rods)}개 라드 처리 완료! 학습 데이터에도 추가되었습니다.")
+                st.rerun()
+
+        # ── Show results ──────────────────────────────────────────────────────
+        if st.session_state.manual_rods:
+            st.markdown(f"**처리된 수동 라드: {len(st.session_state.manual_rods)}개**")
+
+            # Annotated preview
+            preview = img_bgr.copy()
+            for rod in st.session_state.manual_rods:
+                box = cv2.boxPoints(rod["rect"])
+                box = np.intp(box)
+                cv2.drawContours(preview, [box], 0, (0, 215, 255), 2)
+
+            st.image(
+                cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
+                caption="수동 표시 라드 (금색 박스)",
+                use_container_width=True,
+            )
+
+            if st.session_state.manual_df is not None:
+                st.dataframe(st.session_state.manual_df, use_container_width=True, hide_index=True)
+                csv_m = st.session_state.manual_df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "수동 측정 CSV 다운로드", data=csv_m,
+                    file_name=f"{Path(st.session_state.image_name).stem}_manual.csv",
+                    mime="text/csv",
+                )
+
+    except ImportError:
+        st.error(
+            "`streamlit-drawable-canvas` 패키지가 설치되어 있지 않습니다.\n\n"
+            "```\npip install streamlit-drawable-canvas\n```\n\n"
+            "설치 후 앱을 재시작하세요."
         )
