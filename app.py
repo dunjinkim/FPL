@@ -112,16 +112,22 @@ with st.sidebar:
         )
         threshold_method = st.selectbox(
             "이진화 방법",
-            options=["auto", "multi_otsu", "adaptive", "otsu", "triangle"],
+            options=["auto", "edge_fill", "gradient_watershed",
+                     "multi_otsu", "adaptive", "otsu", "triangle"],
             index=0,
             format_func=lambda x: {
-                "auto":       "자동 (권장)",
-                "multi_otsu": "Multi-Otsu — 저콘트라스트에 강함",
-                "adaptive":   "적응형 — 조명 불균일에 강함",
-                "otsu":       "Otsu — 기본",
-                "triangle":   "Triangle — 히스토그램 한쪽 치우침",
+                "auto":               "자동 (권장)",
+                "edge_fill":          "엣지 채우기 ★ — 밝기 무관, 형태로 인식",
+                "gradient_watershed": "기울기 Watershed — 형태 기반",
+                "multi_otsu":         "Multi-Otsu — 저콘트라스트에 강함",
+                "adaptive":           "적응형 — 조명 불균일에 강함",
+                "otsu":               "Otsu — 기본",
+                "triangle":           "Triangle — 히스토그램 한쪽 치우침",
             }[x],
-            help="자동은 Multi-Otsu 시도 후 실패 시 적응형으로 대체합니다.",
+            help=(
+                "라드와 배경 밝기가 비슷한 경우 → '엣지 채우기' 또는 '기울기 Watershed' 선택.\n"
+                "'자동'은 밝기 방법 실패 시 엣지 채우기로 자동 전환합니다."
+            ),
         )
 
     st.markdown("---")
