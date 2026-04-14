@@ -254,10 +254,18 @@ def _binarise(gray: np.ndarray, method: str = "auto") -> np.ndarray:
         return _do_gradient_watershed(gray) or _do_edge_fill(gray)
 
     # ── auto ──
+    # 1. Simple Otsu first — works best when rods are clearly brighter/darker
+    #    than background (most high-contrast SEM images).
+    b_otsu = _do_otsu(gray)
+    if _count_blobs(b_otsu) >= 3:
+        return b_otsu
+
+    # 2. Multi-Otsu — better for moderate contrast
     b_mo = _try_multi_otsu(gray)
     if b_mo is not None and _count_blobs(b_mo) >= 3:
         return b_mo
 
+    # 3. Edge-fill — shape-based; works even when brightness inside ≈ background
     b_ef = _do_edge_fill(gray)
     if _count_blobs(b_ef) >= 3:
         return b_ef
@@ -369,10 +377,27 @@ def detect_rods(
     if max_area_px is None:
         max_area_px = int(h * w * 0.05)
 
-    masked      = _mask_strip(gray, strip_y)
-    preprocessed = _preprocess(masked, enhance_contrast, clahe_clip)
-    binary      = _binarise(preprocessed, method=threshold_method)
-    cleaned     = _morphological_clean(binary)
+    masked = _mask_strip(gray, strip_y)
+
+    # For 'auto' mode try simple Otsu on the RAW (non-CLAHE) image first.
+    # CLAHE equalises the histogram, which can destroy the bimodal separation
+    # that Otsu relies on — hurting performance on already high-contrast images.
+    if threshold_method == "auto":
+        raw_cleaned = _morphological_clean(_do_otsu(masked))
+        if _count_blobs(raw_cleaned) >= 3:
+            # High-contrast image: raw Otsu works → no CLAHE needed
+            preprocessed = masked
+            cleaned      = raw_cleaned
+        else:
+            # Low-contrast: fall back to CLAHE + advanced cascade
+            preprocessed = _preprocess(masked, enhance_contrast, clahe_clip)
+            cleaned      = _morphological_clean(
+                _binarise(preprocessed, method="auto")
+            )
+    else:
+        preprocessed = _preprocess(masked, enhance_contrast, clahe_clip)
+        binary       = _binarise(preprocessed, method=threshold_method)
+        cleaned      = _morphological_clean(binary)
 
     labels      = _watershed_separate(cleaned, preprocessed)
     _, cc_labels = cv2.connectedComponents(cleaned)

@@ -7,6 +7,7 @@ Usage:
 
 import io
 import sys
+import base64
 from pathlib import Path
 
 import cv2
@@ -14,6 +15,39 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image as PILImage
+
+
+# ── streamlit-drawable-canvas compatibility shim ─────────────────────────────
+# Newer Streamlit versions removed the internal `image_to_url` that the canvas
+# library calls.  Patch it back with a base64 data-URI implementation so the
+# canvas still works without requiring a downgrade.
+def _patch_canvas_compat() -> bool:
+    try:
+        import streamlit.elements.image as _m
+        if hasattr(_m, "image_to_url"):
+            return True  # already present, nothing to do
+
+        def _image_to_url_shim(image, width, clamp, channels,
+                               output_format, image_id, allow_emoji=False):
+            """Return a base64 data-URI for the given PIL Image / ndarray."""
+            from PIL import Image as _PIL
+            buf = io.BytesIO()
+            if isinstance(image, _PIL.Image):
+                image.save(buf, format="PNG")
+            elif isinstance(image, np.ndarray):
+                _PIL.fromarray(image).save(buf, format="PNG")
+            else:
+                return str(image)
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            return f"data:image/png;base64,{b64}"
+
+        _m.image_to_url = _image_to_url_shim
+        return True
+    except Exception:
+        return False
+
+
+_canvas_compat_ok = _patch_canvas_compat()
 
 # ── Path setup ───────────────────────────────────────────────────────────────
 ROOT = Path(__file__).parent
@@ -729,9 +763,11 @@ with tab5:
                     mime="text/csv",
                 )
 
-    except ImportError:
-        st.error(
-            "`streamlit-drawable-canvas` 패키지가 설치되어 있지 않습니다.\n\n"
-            "```\npip install streamlit-drawable-canvas\n```\n\n"
-            "설치 후 앱을 재시작하세요."
+    except (ImportError, AttributeError):
+        st.warning(
+            "`streamlit-drawable-canvas`가 현재 Streamlit 버전과 호환되지 않습니다.  \n"
+            "아래 명령으로 패키지를 업데이트하거나 재설치하세요.\n\n"
+            "```\npip install --upgrade streamlit-drawable-canvas\n```\n\n"
+            "그래도 안 될 경우 Streamlit 버전을 낮추세요:\n\n"
+            "```\npip install \"streamlit>=1.28,<1.32\" streamlit-drawable-canvas\n```"
         )
