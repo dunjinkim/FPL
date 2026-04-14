@@ -155,7 +155,7 @@ def detect_rods(
 
     # Also fall back to simple connected components on the cleaned binary
     # (watershed can sometimes merge objects)
-    cc_labels, _ = cv2.connectedComponents(cleaned)
+    _, cc_labels = cv2.connectedComponents(cleaned)
 
     # Use the label map with more objects (typically watershed gives more)
     n_watershed = labels.max()
