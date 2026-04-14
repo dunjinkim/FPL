@@ -245,24 +245,23 @@ with tab1:
 # ════════════════════════════════════════════════════════
 with tab2:
     st.markdown("### 세그멘테이션 결과")
-    if not rods:
+    if st.session_state.scale_info is None:
         st.info("분석을 먼저 실행하세요.")
     else:
-        col_a, col_b = st.columns(2)
-
-        # Binary image
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
-        strip_y = scale_info["strip_y"]
         from analyzer.rod_detector import _mask_strip, _binarise, _morphological_clean
+
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        strip_y = scale_info["strip_y"]
         masked = _mask_strip(gray, strip_y)
         binary = _binarise(masked)
         cleaned = _morphological_clean(binary)
 
+        col_a, col_b = st.columns(2)
+
         with col_a:
             st.image(cleaned, caption="이진화 이미지 (형태학적 처리 후)", use_container_width=True, clamp=True)
 
-        # Overlay all detected rods
+        # Overlay detected rods (if any)
         overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         for rod in rods:
             box = cv2.boxPoints(rod["rect"])
@@ -275,13 +274,15 @@ with tab2:
                 caption=f"검출된 후보 객체: {len(rods)}개",
                 use_container_width=True,
             )
+            if len(rods) == 0:
+                st.warning("라드가 검출되지 않았습니다. 최소 면적·종횡비 파라미터를 낮춰 보세요.")
 
 
 # ════════════════════════════════════════════════════════
 # TAB 3 — Measurement results
 # ════════════════════════════════════════════════════════
 with tab3:
-    if not st.session_state.analysis_done or df_all is None:
+    if df_all is None:
         st.info("분석을 먼저 실행하세요.")
     else:
         df_single  = df_all[df_all["overlap_label"] == LABEL_SINGLE].copy()
@@ -388,7 +389,7 @@ with tab4:
         "🟣 **라드 아님** – 구형 입자, 이물질 등"
     )
 
-    if not rods or df_all is None:
+    if df_all is None:
         st.info("분석을 먼저 실행하세요.")
     else:
         clf = get_classifier()
