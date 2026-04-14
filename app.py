@@ -7,47 +7,12 @@ Usage:
 
 import io
 import sys
-import base64
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image as PILImage
-
-
-# ── streamlit-drawable-canvas compatibility shim ─────────────────────────────
-# Newer Streamlit versions removed the internal `image_to_url` that the canvas
-# library calls.  Patch it back with a base64 data-URI implementation so the
-# canvas still works without requiring a downgrade.
-def _patch_canvas_compat() -> bool:
-    try:
-        import streamlit.elements.image as _m
-        if hasattr(_m, "image_to_url"):
-            return True  # already present, nothing to do
-
-        def _image_to_url_shim(image, width, clamp, channels,
-                               output_format, image_id, allow_emoji=False):
-            """Return a base64 data-URI for the given PIL Image / ndarray."""
-            from PIL import Image as _PIL
-            buf = io.BytesIO()
-            if isinstance(image, _PIL.Image):
-                image.save(buf, format="PNG")
-            elif isinstance(image, np.ndarray):
-                _PIL.fromarray(image).save(buf, format="PNG")
-            else:
-                return str(image)
-            b64 = base64.b64encode(buf.getvalue()).decode()
-            return f"data:image/png;base64,{b64}"
-
-        _m.image_to_url = _image_to_url_shim
-        return True
-    except Exception:
-        return False
-
-
-_canvas_compat_ok = _patch_canvas_compat()
 
 # ── Path setup ───────────────────────────────────────────────────────────────
 ROOT = Path(__file__).parent
@@ -619,155 +584,160 @@ with tab4:
 
 
 # ════════════════════════════════════════════════════════
-# TAB 5 — Manual rod annotation
+# TAB 5 — Manual rod annotation (slider-based, no external dependency)
 # ════════════════════════════════════════════════════════
 with tab5:
     st.markdown("### ✏️ 수동 라드 표시")
     st.markdown(
-        "자동 검출이 실패했을 때 이미지에서 **라드 주위에 사각형을 직접 그려** 측정할 수 있습니다.  \n"
-        "표시된 영역은 학습 데이터(단일 라드)로도 자동 저장됩니다."
+        "자동 검출이 놓친 라드를 보완합니다. "
+        "자동 검출 성공 여부와 **관계없이** 항상 사용할 수 있습니다.  \n"
+        "슬라이더로 라드 위치와 크기를 맞추고 **[+ 라드 추가]** 를 누르세요."
     )
 
-    try:
-        from streamlit_drawable_canvas import st_canvas
+    h_img, w_img = img_bgr.shape[:2]
 
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        pil_img = PILImage.fromarray(img_rgb)
-
-        h_orig, w_orig = img_bgr.shape[:2]
-        CANVAS_W = min(900, w_orig)
-        CANVAS_H = int(h_orig * CANVAS_W / w_orig)
-        scale_x = CANVAS_W / w_orig
-        scale_y = CANVAS_H / h_orig
-
-        pil_resized = pil_img.resize((CANVAS_W, CANVAS_H), PILImage.LANCZOS)
-
-        st.markdown("**사각형 도구로 라드 영역을 그리세요** (여러 개 가능)")
-        canvas_result = st_canvas(
-            fill_color="rgba(255, 255, 0, 0.15)",
-            stroke_width=2,
-            stroke_color="#FFD700",
-            background_image=pil_resized,
-            update_streamlit=True,
-            width=CANVAS_W,
-            height=CANVAS_H,
-            drawing_mode="rect",
-            key=f"canvas_{st.session_state.image_name}",
+    # ── nm/px ────────────────────────────────────────────────────────────────
+    if scale_info and scale_info.get("nm_per_pixel"):
+        nm_per_px_t5 = float(scale_info["nm_per_pixel"])
+        st.caption(f"스케일: {nm_per_px_t5:.4f} nm/px (Tab 1 자동 검출)")
+    else:
+        nm_per_px_t5 = st.number_input(
+            "nm / pixel", min_value=0.001, max_value=10000.0, value=1.0,
+            format="%.4f",
+            help="Tab 1에서 스케일바를 설정하면 자동으로 반영됩니다.",
         )
 
-        objects = canvas_result.json_data.get("objects", []) if canvas_result.json_data else []
-        n_shapes = len(objects)
-        st.caption(f"그려진 사각형: {n_shapes}개")
+    # ── Layout: controls | image ─────────────────────────────────────────────
+    col_ctrl, col_img = st.columns([1, 2], gap="medium")
 
-        # nm/px from scale_info (if available)
-        nm_per_px = None
-        if scale_info and scale_info.get("success") and scale_info.get("nm_per_pixel"):
-            nm_per_px = scale_info["nm_per_pixel"]
-            st.caption(f"스케일 정보: {nm_per_px:.4f} nm/px (자동 검출)")
-        else:
-            nm_per_px_manual = st.number_input(
-                "nm / pixel (수동 입력)", min_value=0.001, max_value=10000.0,
-                value=1.0, format="%.4f",
-                help="스케일바 분석이 안 된 경우 직접 입력하세요. Tab 1에서 설정하면 자동으로 반영됩니다.",
-            )
-            nm_per_px = nm_per_px_manual
+    with col_ctrl:
+        st.markdown("**라드 위치 / 크기**")
+        man_x = st.slider("X 시작 (px)", 0, w_img - 2, w_img // 4, key="man_x")
+        man_y = st.slider("Y 시작 (px)", 0, h_img - 2, h_img // 4, key="man_y")
+        # Clamp max to remaining image space
+        max_w = max(2, w_img - man_x)
+        max_h = max(2, h_img - man_y)
+        default_w = int(st.session_state.get("man_w", max(2, w_img // 8)))
+        default_h = int(st.session_state.get("man_h", max(2, h_img // 8)))
+        man_w = st.slider("너비  (px)", 2, max_w,
+                          min(default_w, max_w), key="man_w")
+        man_h = st.slider("높이  (px)", 2, max_h,
+                          min(default_h, max_h), key="man_h")
 
-        col_btn1, col_btn2 = st.columns(2)
-        with col_btn1:
-            process_btn = st.button(
-                "라드 처리 및 측정", type="primary",
-                disabled=(n_shapes == 0), use_container_width=True
-            )
-        with col_btn2:
-            clear_btn = st.button("수동 라드 초기화", use_container_width=True)
+        est_len = max(man_w, man_h) * nm_per_px_t5
+        est_dia = min(man_w, man_h) * nm_per_px_t5
+        st.caption(f"예상  길이 **{est_len:.0f} nm** / 직경 **{est_dia:.0f} nm**")
 
-        if clear_btn:
-            st.session_state.manual_rods = []
-            st.session_state.manual_df = None
-            st.rerun()
+        st.markdown("")
+        c1, c2 = st.columns(2)
+        with c1:
+            add_btn = st.button("+ 라드 추가", type="primary",
+                                use_container_width=True)
+        with c2:
+            clear_btn = st.button("전체 초기화", use_container_width=True)
 
-        if process_btn and objects:
-            new_rods = []
-            for obj in objects:
-                if obj.get("type") != "rect":
-                    continue
-                # Canvas uses scaleX/scaleY for resize; multiply dimensions
-                sx = obj.get("scaleX", 1.0)
-                sy = obj.get("scaleY", 1.0)
-                rx = int(obj.get("left", 0) / scale_x)
-                ry = int(obj.get("top", 0) / scale_y)
-                rw = int(obj.get("width", 0) * sx / scale_x)
-                rh = int(obj.get("height", 0) * sy / scale_y)
-
-                rx = max(0, min(rx, w_orig - 1))
-                ry = max(0, min(ry, h_orig - 1))
-                rw = max(1, min(rw, w_orig - rx))
-                rh = max(1, min(rh, h_orig - ry))
-
-                feats = _process_manual_rect(img_bgr, rx, ry, rw, rh)
-                if feats:
-                    new_rods.append(feats)
-
-            st.session_state.manual_rods = new_rods
-
-            if new_rods:
-                records = []
-                for i, rod in enumerate(new_rods):
-                    records.append({
-                        "id": f"M{i+1}",
-                        "length_nm": round(rod["long_side_px"] * nm_per_px, 2),
-                        "diameter_nm": round(rod["short_side_px"] * nm_per_px, 2),
-                        "aspect_ratio": round(rod["aspect_ratio"], 3),
-                        "center_x": round(rod["center_x"], 1),
-                        "center_y": round(rod["center_y"], 1),
-                        "area_px2": round(rod["area_px"], 1),
-                    })
-                    # Add to classifier as "single" training example
-                    clf.add_label({
-                        "area_px2": rod["area_px"],
-                        "aspect_ratio": rod["aspect_ratio"],
-                        "solidity": rod["solidity"],
-                        "circularity": rod["circularity"],
-                        "convexity_defect_count": rod["convexity_defect_count"],
-                        "mean_intensity": rod["mean_intensity"],
-                        "std_intensity": rod["std_intensity"],
-                    }, LABEL_SINGLE)
-
-                st.session_state.manual_df = pd.DataFrame(records)
-                st.success(f"{len(new_rods)}개 라드 처리 완료! 학습 데이터에도 추가되었습니다.")
-                st.rerun()
-
-        # ── Show results ──────────────────────────────────────────────────────
         if st.session_state.manual_rods:
-            st.markdown(f"**처리된 수동 라드: {len(st.session_state.manual_rods)}개**")
+            st.markdown(f"**추가된 라드: {len(st.session_state.manual_rods)}개**")
+            # Per-rod delete buttons
+            for i, rod in enumerate(st.session_state.manual_rods):
+                ls = rod["long_side_px"] * nm_per_px_t5
+                ds = rod["short_side_px"] * nm_per_px_t5
+                col_info, col_del = st.columns([3, 1])
+                col_info.caption(f"M{i+1}: L={ls:.0f} D={ds:.0f} nm")
+                if col_del.button("✕", key=f"del_rod_{i}",
+                                  use_container_width=True):
+                    st.session_state.manual_rods.pop(i)
+                    # Rebuild manual_df after deletion
+                    records = []
+                    for j, r in enumerate(st.session_state.manual_rods):
+                        records.append({
+                            "id": f"M{j+1}",
+                            "length_nm":   round(r["long_side_px"]  * nm_per_px_t5, 2),
+                            "diameter_nm": round(r["short_side_px"] * nm_per_px_t5, 2),
+                            "aspect_ratio": round(r["aspect_ratio"], 3),
+                            "center_x":    round(r["center_x"], 1),
+                            "center_y":    round(r["center_y"], 1),
+                            "area_px2":    round(r["area_px"], 1),
+                        })
+                    st.session_state.manual_df = (
+                        pd.DataFrame(records) if records else None
+                    )
+                    st.rerun()
 
-            # Annotated preview
-            preview = img_bgr.copy()
-            for rod in st.session_state.manual_rods:
+    with col_img:
+        # Live preview: auto-detected (dim) + added manual (gold) + current selection (cyan)
+        preview = img_bgr.copy()
+        if rods and df_all is not None:
+            for rod in rods:
                 box = cv2.boxPoints(rod["rect"])
-                box = np.intp(box)
-                cv2.drawContours(preview, [box], 0, (0, 215, 255), 2)
+                cv2.drawContours(preview, [np.intp(box)], 0, (160, 100, 60), 1)
+        for rod in st.session_state.manual_rods:
+            box = cv2.boxPoints(rod["rect"])
+            cv2.drawContours(preview, [np.intp(box)], 0, (0, 215, 255), 2)
+        # Current selection rectangle (bright cyan)
+        cv2.rectangle(preview,
+                      (man_x, man_y),
+                      (min(man_x + man_w, w_img - 1), min(man_y + man_h, h_img - 1)),
+                      (0, 255, 255), 2)
+        st.image(
+            cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
+            caption="🔵 자동 검출 (흐림)  🟡 추가된 수동 라드  ● 현재 선택 (밝은 청록)",
+            use_container_width=True,
+        )
 
-            st.image(
-                cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
-                caption="수동 표시 라드 (금색 박스)",
-                use_container_width=True,
+    # ── Button actions ────────────────────────────────────────────────────────
+    if clear_btn:
+        st.session_state.manual_rods = []
+        st.session_state.manual_df = None
+        st.rerun()
+
+    if add_btn:
+        rx = max(0, man_x)
+        ry = max(0, man_y)
+        rw = max(1, min(man_w, w_img - rx))
+        rh = max(1, min(man_h, h_img - ry))
+        feats = _process_manual_rect(img_bgr, rx, ry, rw, rh)
+        if feats:
+            st.session_state.manual_rods.append(feats)
+            clf.add_label(
+                {
+                    "area_px2":              feats["area_px"],
+                    "aspect_ratio":          feats["aspect_ratio"],
+                    "solidity":              feats["solidity"],
+                    "circularity":           feats["circularity"],
+                    "convexity_defect_count":feats["convexity_defect_count"],
+                    "mean_intensity":        feats.get("mean_intensity", 0),
+                    "std_intensity":         feats.get("std_intensity", 0),
+                },
+                LABEL_SINGLE,
             )
+            records = []
+            for i, rod in enumerate(st.session_state.manual_rods):
+                records.append({
+                    "id":          f"M{i+1}",
+                    "length_nm":   round(rod["long_side_px"]  * nm_per_px_t5, 2),
+                    "diameter_nm": round(rod["short_side_px"] * nm_per_px_t5, 2),
+                    "aspect_ratio":round(rod["aspect_ratio"], 3),
+                    "center_x":   round(rod["center_x"], 1),
+                    "center_y":   round(rod["center_y"], 1),
+                    "area_px2":   round(rod["area_px"], 1),
+                })
+            st.session_state.manual_df = pd.DataFrame(records)
+            st.success(
+                f"라드 추가! 현재 수동 {len(st.session_state.manual_rods)}개 "
+                f"(학습 데이터에도 저장됨)"
+            )
+            st.rerun()
+        else:
+            st.warning("해당 영역에서 라드 윤곽을 찾지 못했습니다. 영역을 다시 조정해 보세요.")
 
-            if st.session_state.manual_df is not None:
-                st.dataframe(st.session_state.manual_df, use_container_width=True, hide_index=True)
-                csv_m = st.session_state.manual_df.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    "수동 측정 CSV 다운로드", data=csv_m,
-                    file_name=f"{Path(st.session_state.image_name).stem}_manual.csv",
-                    mime="text/csv",
-                )
-
-    except (ImportError, AttributeError):
-        st.warning(
-            "`streamlit-drawable-canvas`가 현재 Streamlit 버전과 호환되지 않습니다.  \n"
-            "아래 명령으로 패키지를 업데이트하거나 재설치하세요.\n\n"
-            "```\npip install --upgrade streamlit-drawable-canvas\n```\n\n"
-            "그래도 안 될 경우 Streamlit 버전을 낮추세요:\n\n"
-            "```\npip install \"streamlit>=1.28,<1.32\" streamlit-drawable-canvas\n```"
+    # ── Download ──────────────────────────────────────────────────────────────
+    if st.session_state.manual_df is not None:
+        st.markdown("---")
+        st.dataframe(st.session_state.manual_df, use_container_width=True, hide_index=True)
+        csv_m = st.session_state.manual_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "수동 측정 CSV 다운로드", data=csv_m,
+            file_name=f"{Path(st.session_state.image_name).stem}_manual.csv",
+            mime="text/csv",
         )
