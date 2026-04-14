@@ -100,6 +100,30 @@ with st.sidebar:
     exclude_boundary = st.checkbox("경계 라드 제외", value=True,
         help="이미지 가장자리에 걸친 라드를 측정에서 제외합니다.")
 
+    with st.expander("고급 세그멘테이션 설정"):
+        enhance_contrast = st.checkbox(
+            "콘트라스트 향상 (CLAHE)", value=True,
+            help="저콘트라스트 이미지에서 라드 검출률을 높입니다. 조명 불균일 시 특히 효과적입니다.",
+        )
+        clahe_clip = st.slider(
+            "CLAHE 강도", min_value=1.0, max_value=6.0, value=3.0, step=0.5,
+            help="값이 클수록 콘트라스트를 더 강하게 향상시킵니다. (권장: 2.0~4.0)",
+            disabled=not enhance_contrast,
+        )
+        threshold_method = st.selectbox(
+            "이진화 방법",
+            options=["auto", "multi_otsu", "adaptive", "otsu", "triangle"],
+            index=0,
+            format_func=lambda x: {
+                "auto":       "자동 (권장)",
+                "multi_otsu": "Multi-Otsu — 저콘트라스트에 강함",
+                "adaptive":   "적응형 — 조명 불균일에 강함",
+                "otsu":       "Otsu — 기본",
+                "triangle":   "Triangle — 히스토그램 한쪽 치우침",
+            }[x],
+            help="자동은 Multi-Otsu 시도 후 실패 시 적응형으로 대체합니다.",
+        )
+
     st.markdown("---")
     st.markdown("### 분류 모델")
     clf = get_classifier()
@@ -147,6 +171,9 @@ with st.sidebar:
                 strip_y=scale_info["strip_y"],
                 min_area_px=min_area,
                 min_aspect_ratio=min_ar,
+                enhance_contrast=enhance_contrast,
+                clahe_clip=clahe_clip,
+                threshold_method=threshold_method,
             )
         st.session_state.rods = rods
 
@@ -228,16 +255,28 @@ with tab1:
             help="스케일바 자동 검출이 안 된 경우, 직접 값을 입력하세요."
         )
         if st.button("측정 적용"):
-            if rods:
-                df = measure_rods(rods, manual_nm_per_px,
+            # Re-detect with current parameters so results stay consistent
+            with st.spinner("라드 재검출 중..."):
+                rods_new = detect_rods(
+                    img_bgr,
+                    strip_y=scale_info["strip_y"],
+                    min_area_px=min_area,
+                    min_aspect_ratio=min_ar,
+                    enhance_contrast=enhance_contrast,
+                    clahe_clip=clahe_clip,
+                    threshold_method=threshold_method,
+                )
+            st.session_state.rods = rods_new
+            st.session_state.scale_info["nm_per_pixel"] = manual_nm_per_px
+            st.session_state.scale_info["success"] = True
+            if rods_new:
+                df = measure_rods(rods_new, manual_nm_per_px,
                                   exclude_boundary=exclude_boundary)
                 df = clf.classify(df)
                 st.session_state.df_measured = df
-                st.session_state.analysis_done = True
-                # Update scale_info nm_per_pixel
-                st.session_state.scale_info["nm_per_pixel"] = manual_nm_per_px
-                st.session_state.scale_info["success"] = True
-                st.rerun()
+            else:
+                st.session_state.df_measured = None
+            st.rerun()
 
 
 # ════════════════════════════════════════════════════════
@@ -248,20 +287,37 @@ with tab2:
     if st.session_state.scale_info is None:
         st.info("분석을 먼저 실행하세요.")
     else:
-        from analyzer.rod_detector import _mask_strip, _binarise, _morphological_clean
+        from analyzer.rod_detector import (
+            _mask_strip, _enhance_contrast, _preprocess,
+            _binarise, _morphological_clean,
+        )
 
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         strip_y = scale_info["strip_y"]
         masked = _mask_strip(gray, strip_y)
-        binary = _binarise(masked)
-        cleaned = _morphological_clean(binary)
 
+        # Reproduce the same preprocessing used during analysis
+        preprocessed = _preprocess(masked, enhance_contrast, clahe_clip)
+        binary   = _binarise(preprocessed, method=threshold_method)
+        cleaned  = _morphological_clean(binary)
+
+        # ── Row 1: original vs CLAHE-enhanced ──
+        if enhance_contrast:
+            st.markdown("**전처리 비교**")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.image(masked, caption="원본 (마스크 적용)", use_container_width=True, clamp=True)
+            with c2:
+                enhanced_vis = _enhance_contrast(masked, clip_limit=clahe_clip)
+                st.image(enhanced_vis, caption=f"CLAHE 적용 (강도 {clahe_clip})", use_container_width=True, clamp=True)
+
+        # ── Row 2: binary + overlay ──
+        st.markdown("**세그멘테이션 결과**")
         col_a, col_b = st.columns(2)
 
         with col_a:
-            st.image(cleaned, caption="이진화 이미지 (형태학적 처리 후)", use_container_width=True, clamp=True)
+            st.image(cleaned, caption=f"이진화 ({threshold_method})", use_container_width=True, clamp=True)
 
-        # Overlay detected rods (if any)
         overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         for rod in rods:
             box = cv2.boxPoints(rod["rect"])
@@ -275,7 +331,7 @@ with tab2:
                 use_container_width=True,
             )
             if len(rods) == 0:
-                st.warning("라드가 검출되지 않았습니다. 최소 면적·종횡비 파라미터를 낮춰 보세요.")
+                st.warning("라드가 검출되지 않았습니다. 최소 면적·종횡비를 낮추거나 CLAHE 강도를 높여 보세요.")
 
 
 # ════════════════════════════════════════════════════════
