@@ -23,7 +23,11 @@ sys.path.insert(0, str(ROOT))
 from analyzer.scale_bar import detect_scale_bar
 from analyzer.rod_detector import detect_rods
 from analyzer.measurer import measure_rods, compute_statistics
-from analyzer.overlap_classifier import OverlapClassifier, LABEL_SINGLE, LABEL_OVERLAP
+from analyzer.overlap_classifier import (
+    OverlapClassifier,
+    LABEL_SINGLE, LABEL_OVERLAP, LABEL_PARTIAL, LABEL_NOT_ROD,
+    ALL_LABELS,
+)
 from analyzer.visualizer import (
     annotate_image,
     annotate_scale_bar,
@@ -97,13 +101,14 @@ with st.sidebar:
         help="이미지 가장자리에 걸친 라드를 측정에서 제외합니다.")
 
     st.markdown("---")
-    st.markdown("### 겹침 분류 모델")
+    st.markdown("### 분류 모델")
     clf = get_classifier()
     counts = clf.label_counts()
-    st.markdown(
-        f"학습 데이터: **{counts[LABEL_SINGLE] + counts[LABEL_OVERLAP]}개**  \n"
-        f"단일: {counts[LABEL_SINGLE]}개 / 겹침: {counts[LABEL_OVERLAP]}개"
-    )
+    total = sum(counts.values())
+    label_names = {"single": "단일", "overlap": "겹침", "partial": "일부", "not_rod": "라드 아님"}
+    st.markdown(f"학습 데이터: **{total}개**")
+    for lbl, kor in label_names.items():
+        st.markdown(f"- {kor}: {counts[lbl]}개")
     st.markdown(f"현재 모드: `{clf.mode}`" +
                 (f" (정확도 {clf.accuracy*100:.1f}%)" if clf.accuracy else ""))
 
@@ -115,15 +120,8 @@ with st.sidebar:
             st.cache_resource.clear()
             st.rerun()
     else:
-        remaining_s = max(0, 5 - counts[LABEL_SINGLE])
-        remaining_o = max(0, 5 - counts[LABEL_OVERLAP])
-        msg_parts = []
-        if remaining_s:
-            msg_parts.append(f"단일 {remaining_s}개")
-        if remaining_o:
-            msg_parts.append(f"겹침 {remaining_o}개")
-        if msg_parts:
-            st.caption(f"모델 학습까지 라벨 추가 필요: {', '.join(msg_parts)}")
+        qualified = sum(1 for v in counts.values() if v >= 5)
+        st.caption(f"모델 학습까지 최소 2개 클래스 각 5개 이상 필요 (현재 충족: {qualified}개 클래스)")
 
     if st.button("분석 실행", type="primary", disabled=uploaded is None):
         file_bytes = np.frombuffer(uploaded.read(), dtype=np.uint8)
@@ -286,20 +284,24 @@ with tab3:
     if not st.session_state.analysis_done or df_all is None:
         st.info("분석을 먼저 실행하세요.")
     else:
-        df_single = df_all[df_all["overlap_label"] == LABEL_SINGLE].copy()
+        df_single  = df_all[df_all["overlap_label"] == LABEL_SINGLE].copy()
         df_overlap = df_all[df_all["overlap_label"] == LABEL_OVERLAP].copy()
+        df_partial = df_all[df_all["overlap_label"] == LABEL_PARTIAL].copy()
+        df_notrod  = df_all[df_all["overlap_label"] == LABEL_NOT_ROD].copy()
 
         st.markdown(
             f"**전체 검출:** {len(df_all)}개 &nbsp;|&nbsp; "
-            f"**단일 라드:** {len(df_single)}개 &nbsp;|&nbsp; "
-            f"**겹친 라드:** {len(df_overlap)}개"
+            f"🟢 **단일:** {len(df_single)}개 &nbsp;|&nbsp; "
+            f"🔴 **겹침:** {len(df_overlap)}개 &nbsp;|&nbsp; "
+            f"🔵 **일부:** {len(df_partial)}개 &nbsp;|&nbsp; "
+            f"🟣 **라드 아님:** {len(df_notrod)}개"
         )
 
         # Annotated image
         annotated = annotate_image(img_bgr, rods, df_all, show_measurements=True)
         st.image(
             cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-            caption="초록 = 단일 라드 (측정 포함) / 빨강 = 겹친 라드 (제외)",
+            caption="🟢 단일(측정 포함) / 🔴 겹침 / 🔵 일부 / 🟣 라드 아님 (모두 측정 제외)",
             use_container_width=True,
         )
 
@@ -378,8 +380,12 @@ with tab3:
 with tab4:
     st.markdown("### 학습 데이터 수집")
     st.markdown(
-        "각 객체를 보고 **단일 라드**인지 **겹침(클러스터)**인지 라벨을 달아 주세요.  \n"
-        "라벨이 쌓이면 사이드바의 **모델 학습** 버튼으로 분류기를 개선할 수 있습니다."
+        "각 객체를 보고 알맞은 라벨을 달아 주세요.  \n"
+        "라벨이 쌓이면 사이드바의 **모델 학습** 버튼으로 분류기를 개선할 수 있습니다.\n\n"
+        "🟢 **단일** – 온전한 라드 한 개 &nbsp;|&nbsp; "
+        "🔴 **겹침** – 두 개 이상 겹친 클러스터 &nbsp;|&nbsp; "
+        "🔵 **일부** – 절단되거나 일부만 보이는 라드 &nbsp;|&nbsp; "
+        "🟣 **라드 아님** – 구형 입자, 이물질 등"
     )
 
     if not rods or df_all is None:
@@ -388,13 +394,19 @@ with tab4:
         clf = get_classifier()
         idx_to_row = {int(row["_rod_ref"]): row for _, row in df_all.iterrows()}
 
-        # Show objects that are currently in df (not boundary-excluded)
         visible_rods = [(i, rod) for i, rod in enumerate(rods) if i in idx_to_row]
+
+        _LABEL_BADGE = {
+            LABEL_SINGLE:  ":green[🟢 단일]",
+            LABEL_OVERLAP: ":red[🔴 겹침]",
+            LABEL_PARTIAL: ":blue[🔵 일부]",
+            LABEL_NOT_ROD: ":violet[🟣 라드 아님]",
+        }
 
         if not visible_rods:
             st.info("표시할 객체가 없습니다.")
         else:
-            COLS = 6
+            COLS = 5
             for row_start in range(0, len(visible_rods), COLS):
                 batch = visible_rods[row_start: row_start + COLS]
                 cols = st.columns(COLS)
@@ -402,39 +414,64 @@ with tab4:
                     df_row = idx_to_row[rod_idx]
                     rid = int(df_row["id"])
                     current_label = df_row["overlap_label"]
+                    img_key = st.session_state.image_name
 
                     thumb = extract_thumbnail(img_bgr, rod)
                     with col:
                         st.image(thumb, caption=f"#{rid}", use_container_width=True)
-                        btn_key_s = f"lbl_s_{rid}_{st.session_state.image_name}"
-                        btn_key_o = f"lbl_o_{rid}_{st.session_state.image_name}"
+                        st.markdown(_LABEL_BADGE.get(current_label, ":orange[● 미분류]"))
 
-                        if current_label == LABEL_SINGLE:
-                            st.markdown(":green[● 단일]")
-                        elif current_label == LABEL_OVERLAP:
-                            st.markdown(":red[● 겹침]")
-                        else:
-                            st.markdown(":orange[● 미분류]")
+                        def _make_callback(r_id, lbl):
+                            def cb():
+                                clf.add_label(
+                                    idx_to_row[
+                                        next(k for k, v in idx_to_row.items() if int(v["id"]) == r_id)
+                                    ].to_dict(),
+                                    lbl,
+                                )
+                                st.session_state.df_measured.loc[
+                                    st.session_state.df_measured["id"] == r_id,
+                                    "overlap_label",
+                                ] = lbl
+                            return cb
 
-                        if st.button("단일", key=btn_key_s, use_container_width=True):
-                            clf.add_label(df_row.to_dict(), LABEL_SINGLE)
-                            # update in-memory df
-                            st.session_state.df_measured.loc[
-                                st.session_state.df_measured["id"] == rid, "overlap_label"
-                            ] = LABEL_SINGLE
-                            st.rerun()
-
-                        if st.button("겹침", key=btn_key_o, use_container_width=True):
-                            clf.add_label(df_row.to_dict(), LABEL_OVERLAP)
-                            st.session_state.df_measured.loc[
-                                st.session_state.df_measured["id"] == rid, "overlap_label"
-                            ] = LABEL_OVERLAP
-                            st.rerun()
+                        btn_row1 = st.columns(2)
+                        btn_row2 = st.columns(2)
+                        with btn_row1[0]:
+                            if st.button("단일", key=f"s_{rid}_{img_key}", use_container_width=True):
+                                clf.add_label(df_row.to_dict(), LABEL_SINGLE)
+                                st.session_state.df_measured.loc[
+                                    st.session_state.df_measured["id"] == rid, "overlap_label"
+                                ] = LABEL_SINGLE
+                                st.rerun()
+                        with btn_row1[1]:
+                            if st.button("겹침", key=f"o_{rid}_{img_key}", use_container_width=True):
+                                clf.add_label(df_row.to_dict(), LABEL_OVERLAP)
+                                st.session_state.df_measured.loc[
+                                    st.session_state.df_measured["id"] == rid, "overlap_label"
+                                ] = LABEL_OVERLAP
+                                st.rerun()
+                        with btn_row2[0]:
+                            if st.button("일부", key=f"p_{rid}_{img_key}", use_container_width=True):
+                                clf.add_label(df_row.to_dict(), LABEL_PARTIAL)
+                                st.session_state.df_measured.loc[
+                                    st.session_state.df_measured["id"] == rid, "overlap_label"
+                                ] = LABEL_PARTIAL
+                                st.rerun()
+                        with btn_row2[1]:
+                            if st.button("라드 아님", key=f"n_{rid}_{img_key}", use_container_width=True):
+                                clf.add_label(df_row.to_dict(), LABEL_NOT_ROD)
+                                st.session_state.df_measured.loc[
+                                    st.session_state.df_measured["id"] == rid, "overlap_label"
+                                ] = LABEL_NOT_ROD
+                                st.rerun()
 
         # Running label summary
         counts = clf.label_counts()
         st.markdown("---")
         st.markdown(
-            f"**누적 학습 데이터**: 단일 {counts[LABEL_SINGLE]}개 / 겹침 {counts[LABEL_OVERLAP]}개  \n"
-            f"모델 학습에 필요한 최소 데이터: 각 클래스 5개 이상"
+            f"**누적 학습 데이터**: "
+            f"단일 {counts[LABEL_SINGLE]}개 / 겹침 {counts[LABEL_OVERLAP]}개 / "
+            f"일부 {counts[LABEL_PARTIAL]}개 / 라드 아님 {counts[LABEL_NOT_ROD]}개  \n"
+            f"모델 학습 조건: 최소 2개 클래스 각 5개 이상"
         )

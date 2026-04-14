@@ -1,16 +1,24 @@
 """
-Overlap classifier: distinguish single rods from overlapping clusters.
+Overlap classifier: categorise detected objects in SEM images.
+
+Four classes:
+  single   – single, complete rod  (included in measurements)
+  overlap  – two or more rods touching/stacked
+  partial  – rod cut off at image edge or only partly visible
+  not_rod  – non-rod particle (sphere, debris, etc.)
 
 Two modes:
 1. Rule-based (default, no training data needed)
-   - solidity < threshold  → overlap
-   - area > median * area_multiplier  → overlap
+   - solidity < threshold OR area > median * multiplier → overlap
+   - very high circularity (≈ sphere)                  → not_rod
+   - otherwise                                          → single
+   (partial requires user labelling; not detectable by shape alone)
 
-2. ML mode (Random Forest, activated once enough labels are collected)
-   - Features: area_px, aspect_ratio, solidity, extent, circularity,
-               convexity_defect_count, mean_intensity, std_intensity, perimeter
-   - Labels: "single" | "overlap"
-   - Model persisted to disk with joblib
+2. ML mode (Random Forest, multi-class)
+   Activated once ≥ MIN_SAMPLES_PER_CLASS labels exist for at least 2 classes.
+   Features: area_px2, aspect_ratio, solidity, circularity,
+             convexity_defect_count, mean_intensity, std_intensity
+   Model persisted to disk with joblib.
 """
 
 from __future__ import annotations
@@ -34,9 +42,15 @@ try:
 except ImportError:
     _SKLEARN_OK = False
 
-LABEL_SINGLE = "single"
+LABEL_SINGLE  = "single"
 LABEL_OVERLAP = "overlap"
+LABEL_PARTIAL = "partial"
+LABEL_NOT_ROD = "not_rod"
 LABEL_UNKNOWN = "unknown"
+
+ALL_LABELS = [LABEL_SINGLE, LABEL_OVERLAP, LABEL_PARTIAL, LABEL_NOT_ROD]
+# Labels that are included in final measurements
+MEASURED_LABELS = {LABEL_SINGLE}
 
 _FEATURE_COLS = [
     "area_px2",
@@ -100,7 +114,7 @@ class OverlapClassifier:
         self.labels_path.parent.mkdir(parents=True, exist_ok=True)
         self._labels_df.to_csv(self.labels_path, index=False)
 
-    def add_label(self, rod_features: dict, label: Literal["single", "overlap"]) -> None:
+    def add_label(self, rod_features: dict, label: Literal["single", "overlap", "partial", "not_rod"]) -> None:
         """Add a user-provided label for one rod."""
         row = {col: rod_features.get(col, np.nan) for col in _FEATURE_COLS}
         row["label"] = label
@@ -111,18 +125,13 @@ class OverlapClassifier:
 
     def label_counts(self) -> dict[str, int]:
         counts = self._labels_df["label"].value_counts().to_dict()
-        return {
-            LABEL_SINGLE: counts.get(LABEL_SINGLE, 0),
-            LABEL_OVERLAP: counts.get(LABEL_OVERLAP, 0),
-        }
+        return {lbl: counts.get(lbl, 0) for lbl in ALL_LABELS}
 
     def can_train(self) -> bool:
+        """Can train when at least 2 distinct classes each have ≥ MIN_SAMPLES."""
         c = self.label_counts()
-        return (
-            _SKLEARN_OK
-            and c[LABEL_SINGLE] >= MIN_SAMPLES_PER_CLASS
-            and c[LABEL_OVERLAP] >= MIN_SAMPLES_PER_CLASS
-        )
+        qualified = sum(1 for v in c.values() if v >= MIN_SAMPLES_PER_CLASS)
+        return _SKLEARN_OK and qualified >= 2
 
     # ── Training ─────────────────────────────────────────────────────────────
 
@@ -166,16 +175,26 @@ class OverlapClassifier:
     # ── Classification ───────────────────────────────────────────────────────
 
     def _rule_based(self, rod: dict, median_area: float) -> str:
-        """Simple rule-based classification."""
-        if rod.get("solidity", 1.0) < self.solidity_threshold:
+        """Simple rule-based classification (single / overlap / not_rod only).
+        'partial' cannot be determined from shape alone → requires user labels + ML.
+        """
+        circularity = rod.get("circularity", 0.0)
+        solidity = rod.get("solidity", 1.0)
+        area = rod.get("area_px2", 0)
+
+        # Very round objects that slipped past the aspect-ratio filter
+        if circularity > 0.80 and solidity > 0.90:
+            return LABEL_NOT_ROD
+        if solidity < self.solidity_threshold:
             return LABEL_OVERLAP
-        if rod.get("area_px2", 0) > median_area * self.area_multiplier:
+        if area > median_area * self.area_multiplier:
             return LABEL_OVERLAP
         return LABEL_SINGLE
 
     def classify(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Classify each row in *df* as 'single' or 'overlap'.
+        Classify each row in *df* into one of:
+        'single' | 'overlap' | 'partial' | 'not_rod'
 
         Parameters
         ----------

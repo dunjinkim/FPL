@@ -13,17 +13,22 @@ from io import BytesIO
 
 # ── Colour scheme ────────────────────────────────────────────────────────────
 
-_COLOR_SINGLE = (34, 197, 94)    # green (BGR)
-_COLOR_OVERLAP = (239, 68, 68)   # red   (BGR)
-_COLOR_UNKNOWN = (251, 191, 36)  # amber (BGR)
+_COLOR_SINGLE  = (34,  197,  94)   # green  (BGR)
+_COLOR_OVERLAP = (239,  68,  68)   # red    (BGR)
+_COLOR_PARTIAL = ( 59, 130, 246)   # blue   (BGR)
+_COLOR_NOT_ROD = (168,  85, 247)   # purple (BGR)
+_COLOR_UNKNOWN = (251, 191,  36)   # amber  (BGR)
+
+_LABEL_COLORS = {
+    "single":  _COLOR_SINGLE,
+    "overlap": _COLOR_OVERLAP,
+    "partial": _COLOR_PARTIAL,
+    "not_rod": _COLOR_NOT_ROD,
+}
 
 
 def _label_color(label: str) -> tuple[int, int, int]:
-    if label == "single":
-        return _COLOR_SINGLE
-    if label == "overlap":
-        return _COLOR_OVERLAP
-    return _COLOR_UNKNOWN
+    return _LABEL_COLORS.get(label, _COLOR_UNKNOWN)
 
 
 # ── Annotated image ──────────────────────────────────────────────────────────
